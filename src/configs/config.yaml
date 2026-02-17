@@ -1,0 +1,7 @@
+# Default configuration file for initial debate phase
+
+# Experiment settings
+experiment:
+  name: default_experiment
+  description: "Default configuration for training a transformer"
+

@@ -1,0 +1,143 @@
+# @package _global_
+
+# Override Experiment settings
+experiment:
+  project: DeformableMouse
+  name: SpatialTransformerMSE
+  description: "Configuration Spatial transformer with a simple MSE loss"
+
+model:
+  encoder:
+    embed_dim: 256
+    depth: 8
+    num_heads: 8
+    mlp_ratio: 6
+    qkv_bias: False
+    drop_rate: 0.0
+    attn_drop_rate: 0.0
+    proj_dim: 1024
+    enable_last_norm: True
+  decoder:
+    proj_dim: 1024
+    decoder_num_heads: 8
+    decoder_layers: 5
+    decoder_dim_feedforward: 1024
+    decoder_dropout: 0.0
+    predict_depth: False
+    use_depth_conditioning: False
+    confidence: False
+
+train_dataset:
+  file_path: "./data/glob3DBodyParts.csv"
+  norm_path: "./data/glob3DBodyParts_normalizer.npy"
+  cameras: ['top', 'side', 'front']
+  reference_parts: ["head center", "tail base"]
+  n_rotations: 18
+  train_ratio: 0.2
+  pose_threshold: 0.01
+
+test_dataset:
+  file_path: "./data/track_2_speed_change.csv"
+  cameras: ['top', 'side', 'front']
+  reference_parts: ["head center", "tail base"]
+  n_rotations: 10
+  output_dir: ./checkpoints/MVT/MSE_loss/test/
+  num_vis_samples: 8
+  batch_size: 32
+  occlusion_ratio: 0.2
+  num_workers: 4
+
+training:
+  batch_size: 32
+  num_workers: 4
+
+  weight_decay: 1e-4
+  learning_rate: 1e-5
+
+  epochs: 200
+  warmup_epochs: 10
+  warmup_start_factor: 0.1
+  min_learning_rate: 1e-7
+  patience: 10
+
+  grad_clip: 1.0
+  log_interval: 150
+  visualize_interval: 10
+  device: 'cuda'
+  checkpoint_interval: 10
+  checkpoint_dir: './checkpoints/MVT/MSE_loss/'
+  ema_decay: 0.99
+
+  # Logging
+  logging:
+    use_wandb: true
+    wandb_project: MVTransformer
+    wandb_entity: null
+    run_name: "final_run_mse"
+
+
+loss:
+  huber_delta: 0.01
+  
+  components:
+    2d:
+      enabled: true
+      weight: 1.0
+      warmup_epochs: 1
+    depth:
+      enabled: false
+      weight: 0.5
+      warmup_epochs: 1
+    confidence:
+      enabled: false
+      weight: 0.3
+      warmup_epochs: 1
+    triangulation_residual:
+      enabled: False
+      weight: 0.5
+      warmup_epochs: 5
+    triangulation_diff:
+      enabled: false
+      weight: 1.0
+      warmup_epochs: 5
+    diff_coord:
+      enabled: false
+      weight: 1.0
+      warmup_epochs: 5
+    depth_diff:
+      enabled: false
+      weight: 0.5
+      warmup_epochs: 5
+    cycle_coord:
+      enabled: false
+      weight: 1.0
+      warmup_epochs: 5
+    cycle_depth:
+      enabled: false
+      weight: 0.5
+      warmup_epochs: 5
+
+curriculum:
+  masking_schedule:
+    scheme: 'constant'
+    start_ratio: 0.3
+    end_ratio: 0.5
+    total_epochs: 50
+  
+  loss_schedule:
+    2d: 0
+    depth: 0
+    triangulation_diff: 0
+    triangulation_residual: 10
+    diff_coord: 5
+    depth_diff: 5
+    cycle_coord: 10
+    cycle_depth: 10
+    confidence: 15
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false 
