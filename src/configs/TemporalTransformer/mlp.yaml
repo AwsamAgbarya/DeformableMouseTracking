@@ -1,0 +1,59 @@
+# @package _global_
+
+# Override Experiment settings
+experiment:
+  project: DeformableMouse
+  name: TemporalTransformer
+  description: "Configuration Temporal denoising transformer with a simple MSE loss"
+
+train_dataset:
+  file_path: "./data/glob3DBodyParts.csv"
+  pred_dir: "./data/predictions_train/"
+  T_in: 5
+  T_out: 1
+  batch_size: 32
+
+val_dataset:
+  file_path: "./data/glob3DBodyParts.csv"
+  pred_dir: "./data/predictions_train/"
+  T_in: 5
+  T_out: 1
+  batch_size: 32
+
+
+model:
+  type: 'MLPSpatialCorrector'
+  encoder:
+    history_dim: 128
+    num_layers: 8
+    dropout: 0.1
+    use_gru: True
+  spatial_corrector:
+    hidden_dim: 256
+    num_layers: 8
+    dropout: 0.1
+
+training:
+  learning_rate: 5e-4
+  min_learning_rate: 1e-6
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  warmup_start_factor: 0.1
+  warmup_epochs: 5
+  total_epochs: 300
+  patience: 20
+  output_dir: './checkpoints/MTT/MSE_all'
+
+loss:
+  skeleton: False
+  temporal: False
+  lambda_coord: 1.0
+  lambda_bone: 0.5
+  lambda_vel: 0.1
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false 

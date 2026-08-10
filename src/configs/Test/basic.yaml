@@ -1,0 +1,57 @@
+# @package _global_
+experiment:
+  project: DeformableMouse
+  name: BasicPredictorCorrector
+
+test_dataset:
+  file_path: "./data/glob3DBodyParts.csv"
+  cameras: ['top', 'side', 'front']
+  reference_parts: ["head center", "tail base"]
+  output_dir: ./checkpoints/test/basic/
+  batch_size: 32
+  occlusion_ratio: 0.3
+  num_workers: 4
+
+model:
+  encoder:
+    embed_dim: 256
+    depth: 8
+    num_heads: 8
+    mlp_ratio: 6
+    qkv_bias: False
+    drop_rate: 0.0
+    attn_drop_rate: 0.0
+    proj_dim: 1024
+    enable_last_norm: True
+  decoder:
+    proj_dim: 1024
+    decoder_num_heads: 8
+    decoder_layers: 5
+    decoder_dim_feedforward: 1024
+    decoder_dropout: 0.0
+    predict_depth: False
+    use_depth_conditioning: False
+    confidence: False
+
+corrector:
+  type: 'MLPSpatialCorrector'
+  encoder:
+    history_dim: 128
+    num_layers: 8
+    dropout: 0.1
+    use_gru: True
+  spatial_corrector:
+    hidden_dim: 256
+    num_layers: 8
+    dropout: 0.1
+
+training:
+  model_dir: './checkpoints/MVT/MSE_loss/'
+  corrector_dir: './checkpoints/MTT/MSE_all/checkpoints/'
+
+  # Hydra configuration
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false 

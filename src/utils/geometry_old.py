@@ -1,6 +1,8 @@
 import numpy as np
 import torch
+from scipy.interpolate import CubicSpline
 
+# MVT
 def project_points(points_3d: torch.Tensor, P: torch.Tensor):
     """
     points_3d: [B, N, 3]  (or [N,3] -> will be unsqueezed)
@@ -27,7 +29,7 @@ def project_points(points_3d: torch.Tensor, P: torch.Tensor):
     pixels = proj[..., :2] / (depths.unsqueeze(-1) + 1e-8)
 
     return pixels, depths
-
+# MVT
 def triangulate_points(points_2d, Ps):
     """
     Linear multi-view triangulation via SVD.
@@ -75,7 +77,7 @@ def triangulate_points(points_2d, Ps):
     # Reshape back to [B, N, 3]
     return X.reshape(B, N, 3)
 
-    
+# MVT
 def unproject_points(pixels_2d, depths, P):
     """
     Unproject 2D pixels + depth using projection matrix P directly
@@ -111,6 +113,7 @@ def unproject_points(pixels_2d, depths, P):
     
     return X_world
 
+#MVT
 def get_predefined_cams(direction):
     if direction == "front":
         return torch.tensor([
@@ -126,9 +129,9 @@ def get_predefined_cams(direction):
                         ])
     elif direction == "top":
         return torch.tensor([
-                            [0.6, 0, 0.0, 170],
-                            [0, -0.6, 0.0, 390],
-                            [0, 0, 0.0, 1]
+                            [ 0.6000,  0.0000, -0.0000,  170.0000],
+                            [ 0.0000, -0.6000, -0.0000,  390.0000],
+                            [ 0.0000,  0.0000, -0.0025,   1.0000 ],
                         ])
     elif direction == "right":
         return torch.tensor([
@@ -151,54 +154,14 @@ def get_predefined_cams(direction):
     else:
         return None
 
-def baseline_triangulation(keypoints_2d, visibility_mask, camera_matrices):
-    """
-    keypoints_2d: (num_views, num_keypoints, 2)
-    visibility_mask: (num_views, num_keypoints) - bool
-    camera_matrices: (num_views, 3, 4) - projection matrices
-    """
-    num_keypoints = keypoints_2d.shape[1]
-    num_views = keypoints_2d.shape[0]
-    points_list = []
-    
-    for kp_idx in range(num_keypoints):
-        # Collect visible observations
-        visible_views = visibility_mask[:, kp_idx]
-        if visible_views.sum() < num_views:
-            if visible_views.sum() < 2:
-                points_list.append(torch.zeros((3,)))
-            else:
-                # Triangulate from visible views
-                points_list.append(triangulate_points(
-                    keypoints_2d[visible_views, kp_idx][:, None, :],
-                    [x for i,x in enumerate(camera_matrices) if visible_views[i]]
-                ))
-    # Project back to all views
-    points_3d = torch.vstack(points_list)
-    traj_list = []
-    for view in camera_matrices:
-        proj_data = project_points(points_3d,view)[0]
-        traj_list.append(proj_data)
-    predicted_2d = torch.vstack(traj_list).view(num_views, -1, 2)
-
-    # Re-insert the data back into the masked spots
-    counter = 0
-    result = []
-    for i in range(num_keypoints):
-        if visibility_mask[:, i].sum() == num_views:
-            result.append(keypoints_2d[:, i, :])
-        else:
-            result.append(predicted_2d[:,counter,:])
-            counter+=1
-    tmp = torch.vstack(result) # (N,2)
-    return torch.stack([tmp[i::num_views] for i in range(num_views)]) # (C, N, 2)
-
+# data analysis
 def compute_linear_velocities(coords, fps):
     # Delta Position / Delta Time
     dt = 1.0 / fps
     diff_points = torch.vstack([torch.zeros_like(coords[0]).unsqueeze(0), coords[1:] - coords[:-1]])
     return diff_points / dt
 
+# data analysis
 def compute_angular_velocity(centered, fps):
     """
     Computes the global Angular Velocity vector for the skeleton per frame.
@@ -262,6 +225,7 @@ def compute_angular_velocity(centered, fps):
     
     return ang_vel
 
+# triangulation MVT and data analysis
 def extract_deformable_coordinates(noisy_points, template, confidence_weights=None, device='cuda'):
     """
     Closed-form weighted Procrustes alignment (Kabsch algorithm) to extract the rigid coordinates.
@@ -314,6 +278,7 @@ def extract_deformable_coordinates(noisy_points, template, confidence_weights=No
     
     return aligned.cpu(), R.cpu(), t.cpu()
 
+# data analysis
 def decompose_projection(P, validate=True):
     """
     Robustly decompose a 3x4 projection matrix into intrinsics (K) and world-to-camera extrinsics [R|t].
@@ -447,3 +412,128 @@ def decompose_projection(P, validate=True):
         print("="*70 + "\n")
         
     return K, extrinsics_w2c
+
+# OAT
+def linear_interpolate_keypoints(
+    keypoints: np.ndarray,
+    mask: np.ndarray,
+    outlier_frames: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Naive linear interpolation for occluded keypoints over time.
+
+    For each joint, linearly interpolates missing frames using the nearest
+    visible frames before and after. Leading/trailing gaps are filled by
+    repeating the nearest visible value (constant extrapolation).
+
+    Args:
+        keypoints: (T, N, 3) array of 3D keypoint coordinates over time.
+        mask:      (T, N, 1) or (T, N) boolean array. True = visible.
+        outlier_frames: (T,) boolean array. True = outlier frame.
+
+    Returns:
+        (T, N, 3) array with occluded frames filled via linear interpolation.
+    """
+    keypoints = np.array(keypoints, dtype=np.float64)
+    mask = np.array(mask, dtype=bool)
+    if mask.ndim == 3:
+        mask = mask[..., 0]  # (T, N)
+
+    T, N, D = keypoints.shape
+    assert D == 3, f"Expected (T, N, 3), got last dim {D}"
+    assert mask.shape == (T, N), f"mask must be (T, N) or (T, N, 1), got {mask.shape}"
+
+    result = keypoints.copy()
+    t_idx = np.arange(T, dtype=float)
+
+    for n in range(N):
+        visible = mask[:, n]           # (T,) — which frames are visible for joint n
+        # To not count outlier frames, we set their entire mask to true so they dont get interpolated over
+        if outlier_frames is not None:
+            visible = visible | outlier_frames
+
+        vis_t = np.where(visible)[0]
+
+        if len(vis_t) == 0:
+            continue  # No visible frames; leave as-is
+        if len(vis_t) == T:
+            continue  # All visible; nothing to do
+
+        occ_t = np.where(~visible)[0]
+
+        for dim in range(3):
+            result[occ_t, n, dim] = np.interp(
+                t_idx[occ_t],
+                vis_t.astype(float),
+                keypoints[vis_t, n, dim],
+            )
+
+    return result
+
+# OAT test
+def cubic_spline_interpolate_keypoints(
+    keypoints: np.ndarray,
+    mask: np.ndarray,
+    min_visible_for_spline: int = 4,
+    outlier_frames: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Cubic spline interpolation with optional bone-length projection.
+
+    For each joint, fits a cubic spline through its visible frames and uses
+    it to fill occluded frames. Falls back to linear interpolation when fewer
+    than `min_visible_for_spline` visible frames exist for a joint.
+
+    Args:
+        keypoints:                  (T, N, 3) array of 3D keypoints over time.
+        mask:                       (T, N, 1) or (T, N) boolean. True = visible.
+        min_visible_for_spline:     Minimum visible frames to fit a cubic spline
+                                    (must be >= 4). Falls back to linear otherwise.
+        outlier_frames:             (T,) boolean array. True = outlier frame.
+
+    Returns:
+        (T, N, 3) array with occluded frames filled and optionally projected.
+    """
+    keypoints = np.array(keypoints, dtype=np.float64)
+    mask = np.array(mask, dtype=bool)
+    if mask.ndim == 3:
+        mask = mask[..., 0]  # (T, N)
+
+    T, N, D = keypoints.shape
+    assert D == 3, f"Expected (T, N, 3), got last dim {D}"
+    assert mask.shape == (T, N), f"mask must be (T, N) or (T, N, 1), got {mask.shape}"
+    assert min_visible_for_spline >= 4, "cubic spline requires at least 4 control points"
+
+    result = keypoints.copy()
+    t_idx = np.arange(T, dtype=float)
+
+    for n in range(N):
+        visible = mask[:, n]           # (T,) visibility for joint n
+        # To not count outlier frames, we set their entire mask to true so they dont get interpolated over
+        if outlier_frames is not None:
+            visible = visible | outlier_frames
+        vis_t = np.where(visible)[0]
+        occ_t = np.where(~visible)[0]
+
+        if len(vis_t) == 0 or len(occ_t) == 0:
+            continue
+
+        # --- Step 1: Spline or linear interpolation per joint trajectory ---
+        if len(vis_t) >= min_visible_for_spline:
+            for dim in range(3):
+                cs = CubicSpline(
+                    vis_t.astype(float),
+                    keypoints[vis_t, n, dim],
+                    extrapolate=True,
+                )
+                result[occ_t, n, dim] = cs(occ_t.astype(float))
+        else:
+            # Fall back to linear for this joint
+            for dim in range(3):
+                result[occ_t, n, dim] = np.interp(
+                    t_idx[occ_t],
+                    vis_t.astype(float),
+                    keypoints[vis_t, n, dim],
+                )
+
+    return result

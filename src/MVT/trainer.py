@@ -143,7 +143,7 @@ class Trainer:
                 curriculum_weight = loss_weights.get(loss_name, 0.0)
                 weighted_loss = loss_value * curriculum_weight
                 total_loss += weighted_loss
-                weighted_losses[loss_name] = loss_value.item()
+                weighted_losses[loss_name] = weighted_loss.item()
 
             # Backward pass
             total_loss.backward()

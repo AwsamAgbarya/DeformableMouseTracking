@@ -4,7 +4,7 @@
 experiment:
   project: DeformableMouse
   name: SpatialTransformerMSE
-  description: "Configuration Spatial transformer with a simple MSE loss"
+  description: "Configuration Spatial transformer with a simple MSE loss and a TriRes regularization"
 
 model:
   encoder:
@@ -25,7 +25,7 @@ model:
     decoder_dropout: 0.0
     predict_depth: False
     use_depth_conditioning: False
-    confidence: False
+    confidence: True
 
 train_dataset:
   file_path: "./data/glob3DBodyParts.csv"
@@ -37,14 +37,12 @@ train_dataset:
   pose_threshold: 0.01
 
 test_dataset:
-  file_path: "./data/track_2_speed_change.csv"
+  file_path: "./data/glob3DBodyParts.csv"
   cameras: ['top', 'side', 'front']
   reference_parts: ["head center", "tail base"]
-  n_rotations: 10
-  output_dir: ./checkpoints/MVT/MSE_loss/test/
-  num_vis_samples: 8
+  output_dir: ./checkpoints/MVT/MSE_TRIRES/test/
   batch_size: 32
-  occlusion_ratio: 0.2
+  occlusion_ratio: 0.3
   num_workers: 4
 
 training:
@@ -65,7 +63,7 @@ training:
   visualize_interval: 10
   device: 'cuda'
   checkpoint_interval: 10
-  checkpoint_dir: './checkpoints/MVT/MSE_loss/'
+  checkpoint_dir: './checkpoints/MVT/MSE_TRIRES/'
   ema_decay: 0.99
 
   # Logging
@@ -73,7 +71,7 @@ training:
     use_wandb: true
     wandb_project: MVTransformer
     wandb_entity: null
-    run_name: "final_run_mse"
+    run_name: "mse_tri_res_run"
 
 
 loss:
@@ -89,12 +87,12 @@ loss:
       weight: 0.5
       warmup_epochs: 1
     confidence:
-      enabled: false
-      weight: 0.3
+      enabled: False
+      weight: 0.001
       warmup_epochs: 1
     triangulation_residual:
-      enabled: False
-      weight: 0.5
+      enabled: True
+      weight: 0.00001
       warmup_epochs: 5
     triangulation_diff:
       enabled: false
@@ -128,7 +126,7 @@ curriculum:
     2d: 0
     depth: 0
     triangulation_diff: 0
-    triangulation_residual: 10
+    triangulation_residual: 20
     diff_coord: 5
     depth_diff: 5
     cycle_coord: 10

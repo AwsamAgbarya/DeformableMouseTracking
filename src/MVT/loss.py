@@ -56,6 +56,7 @@ class KeypointLoss(nn.Module):
         # 2D Keypoint Loss
         loss_2d, kpt_point_loss = self.compute_2d_loss(keypoints_2d_pred, keypoints_2d_gt, masks)
         losses['2d'] = loss_2d
+        depth_point_loss = 0.0
 
         if self.loss_config['depth']['enabled']:
             # Depth Loss

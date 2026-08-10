@@ -1,119 +1,27 @@
+'''
+MLP: Default Submodule MLP block used for TransformerBlocks
+SelfAttention: Default Submodule self-attention block used for TransformerBlocks
+TransformerBlock: Submodule used for MVT encoder and OAT encoder
+
+PoolingAttention: Default Submodule Pooling Attention block used for AttentionPoolingBlock
+AttentionPoolingBlock: Submodule used for MVT encoder
+
+GlobalAttentionPoolingBlock: Submodule used for OAT encoder
+
+CrossViewTransformerBlock: Submodule used for MVT decoder
+
+PositionalEncoding: Default positional encoding block used for MVT and OAT encoders
+
+RelativeTemporalEncoding: Default module for frame indexing for OAT temporal decoder
+TemporalDecoderBlock: Defauult OAT temporal decoder block
+'''
 import torch
 from torch import nn
 import numpy as np
 import math
 
-class GELUActivationXAI(nn.Module):
-    """
-    GeLU activation module.
-    """
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return input * 0.5 * (1.0 + torch.erf(input / math.sqrt(2.0)))
-    
-    def conservative_forward(self, input: torch.Tensor) -> torch.Tensor:
-        gelu = input * 0.5 * (1.0 + torch.erf(input / math.sqrt(2.0)))
-        out = input * (gelu/(input+1e-9)).detach()
-        return out
-    
-
-class LayerNormXAI(nn.Module):
-    """
-    Layer Normalization Module.
-    """
-    
-    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
-        """
-        Args:
-            normalized_shape (int or tuple): 
-                Input shape from an expected input of size
-            eps (float):
-                A value added to the denominator for numerical stability. Default: 1e-5
-            elementwise_affine (bool):
-                Whether to include learnable affine parameters. Default: True
-        """
-        super().__init__()
-        
-        if isinstance(normalized_shape, int):
-            normalized_shape = (normalized_shape,)
-        self.normalized_shape = tuple(normalized_shape)
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(normalized_shape))
-            self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
-    
-    def forward(self, input):
-        """
-        Forward pass
-        
-        Args:
-            input (torch.Tensor): Input tensor of shape (..., *normalized_shape)
-        
-        Returns:
-            torch.Tensor: Normalized tensor of the same shape as input
-        """
-        # Compute mean and std along the last len(normalized_shape) dimensions
-        # For typical usage with shape (B, N, C), this normalizes over C
-        dims = list(range(-len(self.normalized_shape), 0))
-        
-        # Compute mean and standard deviation
-        mean = input.mean(dim=dims, keepdim=True)
-        std = torch.sqrt(((input - mean) ** 2).mean(dim=dims, keepdim=True))
-        input_norm = (input - mean) / (std + self.eps)
-        
-        # Apply affine transformation if enabled
-        if self.elementwise_affine:
-            return input_norm * self.weight + self.bias
-        else:
-            return input_norm
-        
-        
-    def conservative_forward(self, input):
-        """
-        Forward pass with detachment trick for explainability.
-        
-        Args:
-            input (torch.Tensor): Input tensor of shape (..., *normalized_shape)
-        
-        Returns:
-            torch.Tensor: Normalized tensor of the same shape as input
-        """
-        # Compute mean and std along the last len(normalized_shape) dimensions
-        # For typical usage with shape (B, N, C), this normalizes over C
-        dims = list(range(-len(self.normalized_shape), 0))
-        
-        # Compute mean and standard deviation
-        mean = input.mean(dim=dims, keepdim=True)
-        variance = ((input - mean) ** 2).mean(dim=dims, keepdim=True)
-        std = torch.sqrt(variance)
-        
-        # Normalize: detach std to prevent gradients flowing through variance
-        input_norm = (input - mean.detach()) / (std.detach() + self.eps)
-        
-        # Apply affine transformation if enabled
-        if self.elementwise_affine:
-            return input_norm * self.weight + self.bias
-        else:
-            return input_norm
-
-    def extra_repr(self):
-        return '{normalized_shape}, eps={eps}, elementwise_affine={elementwise_affine}'.format(**self.__dict__)
-
 class Mlp(nn.Module):
-    """
-    A Multi-layer perceptron module.
-    Shape:
-        Input:  (B, N, C)
-        Output: (B, N, out_features)
-    """
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=GELUActivationXAI, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
         """
         Initialization function
         Args:
@@ -123,9 +31,6 @@ class Mlp(nn.Module):
                 Dimension of the hidden layer. If None, defaults to `in_features`.
             out_features (int or None, optional):
                 Output feature dimension. If None, defaults to `in_features`.
-            act_layer (nn.Module, optional):
-                Activation function applied between the two linear layers.
-                Default: GELUActivationXAI.
             drop (float, optional):
                 Dropout probability applied after the second linear layer.
                 Default: 0.0.
@@ -134,13 +39,12 @@ class Mlp(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
+        self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
     
     def forward(self, x):
         """
-        Forward pass of the MLP module.
         Args:
             x (torch.Tensor): Input tensor of shape (B, N, C).
         Returns:
@@ -153,18 +57,9 @@ class Mlp(nn.Module):
         return x
 
 class SelfAttention(nn.Module):
-    """
-    Multi-Head Self-Attention module.
-
-    Shape:
-        Input: (B, N, C)
-        Output: (B, N, C)
-    """
-
     def __init__(self, input_dim, num_heads=8, qkv_bias=False, qk_scale=None, 
                  attn_drop=0., proj_drop=0., attn_head_dim=None):
         """
-        Initialization function
         Args:
             input_dim C (int):
                 Input embedding dimension.
@@ -201,8 +96,6 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, attn_mask=None, output_attn=False):
         """
-        Compute the forward pass of the multi-head self-attention module.
-
         Args:
             x (torch.Tensor):
                 Input tensor of shape (B, N, C), where:
@@ -248,51 +141,28 @@ class SelfAttention(nn.Module):
             return (x, attn)
         else:
             return x
-        
-    def conservative_forward(self, x, output_attn=False):
-        """
-        Compute the forward pass of the multi-head self-attention module.
+    
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, 
+                 drop=0., attn_drop=0., attn_head_dim=None):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
 
+        self.attn = SelfAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, attn_head_dim=attn_head_dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
+
+    def forward(self, x, attn_mask=None):
+        """
         Args:
-            x (torch.Tensor):
-                Input tensor of shape (B, N, C), where:
-                - B is batch size
-                - N is sequence or token length
-                - C is embedding dimension
-            output_attn (bool):
-                Whether to output the attention matrix or not, Default: False.
-        Returns:
-            torch.Tensor:
-                Output tensor of shape (B, N, C), same as input dimension.
+            x (torch.Tensor): Input tensor of shape (B, N, C).
+            attn_mask (torch.Tensor, optional): Attention mask of shape (B, N, N) or (N, N).
+                      Should contain -inf for positions to mask out, 0 for valid positions.
         """
-        B, N, C = x.shape
-        # Project input into Q, K, V using a single linear layer.
-        qkv = self.qkv(x)
-        # Reshape and permute into (B, heads, N, head_dim).
-        qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-        # Compute scaled dot-product attention.
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        # Apply softmax to get attention weights.
-        attn = attn.softmax(dim=-1)
-        # For faithful explanations
-        attn = attn.detach()
-        attn = self.attn_drop(attn)
-
-        # Multiply weights with values and concatenate all heads
-        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
-        # Final projection
-        x = self.proj(x)
-        x = self.proj_drop(x)
-
-        if output_attn:
-            return (x, attn)
-        else:
-            return x
-        
 class PoolingAttention(nn.Module):
     """
     Cross-Attention module for attention pooling.
@@ -337,59 +207,11 @@ class PoolingAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-    
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, 
-                 drop=0., attn_drop=0., act_layer=GELUActivationXAI, 
-                 norm_layer=LayerNormXAI, attn_head_dim=None):
-        super().__init__()
-        
-        self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(dim)
 
-        self.attn = SelfAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop, attn_head_dim=attn_head_dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), 
-                       act_layer=act_layer, drop=drop)
-
-    def forward(self, x, attn_mask=None):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, N, C).
-            attn_mask (torch.Tensor, optional): Attention mask of shape (B, N, N) or (N, N).
-                      Should contain -inf for positions to mask out, 0 for valid positions.
-        """
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.norm2(x))
-        return x
-    
-    def conservative_forward(self, x):
-        """
-        Apply attention and MLP sublayers with residual connections.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, N, C).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, N, C).
-        """
-        x = x + self.attn.conservative_forward(self.norm1.conservative_forward(x))
-        x = x + self.mlp(self.norm2.conservative_forward(x))
-        return x
-    
 
 class AttentionPoolingBlock(nn.Module):
-    """
-    Transformer pooling block using Pooling by Multihead Attention (PMA).
-    
-    Shape:
-        Input:  (B, N, C) - Batch, Number of Keypoints, Channels
-        Output: (B, 1, C) - Batch, 1, Channels (Pooled latent vector)
-    """
     def __init__(self, input_dim, output_dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, 
-                 drop=0., attn_drop=0., act_layer=GELUActivationXAI, norm_layer=LayerNormXAI
-                 ):
+                 drop=0., attn_drop=0.):
         super().__init__()
         
         # Learnable Seed Vector (The Query)
@@ -397,17 +219,15 @@ class AttentionPoolingBlock(nn.Module):
         self.input_proj = nn.Linear(input_dim, output_dim)
         
         # Normalization Layers
-        self.norm_seed = norm_layer(output_dim)   # Norm for the query (seed)
-        self.norm_ctx = norm_layer(output_dim)    # Norm for the key/value (input points)
+        self.norm_seed = nn.LayerNorm(output_dim)   # Norm for the query (seed)
+        self.norm_ctx = nn.LayerNorm(output_dim)    # Norm for the key/value (input points)
 
         # Cross Attention Module
-        self.attn = PoolingAttention(
-            output_dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop)
+        self.attn = PoolingAttention(output_dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
             
         # MLP
-        self.norm2 = norm_layer(output_dim)       # Norm before MLP
-        self.mlp = Mlp(in_features=output_dim, hidden_features=int(output_dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.norm2 = nn.LayerNorm(output_dim)       # Norm before MLP
+        self.mlp = Mlp(in_features=output_dim, hidden_features=int(output_dim * mlp_ratio), drop=drop)
 
     def forward(self, x):
         """
@@ -433,21 +253,74 @@ class AttentionPoolingBlock(nn.Module):
         return x
 
 
+class GlobalAttentionPoolingBlock(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+    ):
+        super().__init__()
+
+        self.seed = nn.Parameter(torch.randn(1, 1, output_dim))
+        self.input_proj = nn.Linear(input_dim, output_dim)
+
+        self.norm_seed = nn.LayerNorm(output_dim)
+        self.norm_ctx = nn.LayerNorm(output_dim)
+
+        self.attn = PoolingAttention(
+            output_dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        self.norm2 = nn.LayerNorm(output_dim)
+        self.mlp = Mlp(in_features=output_dim, hidden_features=int(output_dim * mlp_ratio), drop=drop)
+
+        self.init_weights()
+
+    def init_weights(self):
+        nn.init.normal_(self.seed, std=0.02)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, N, C_in)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C_out)
+        """
+        B, N, _ = x.shape
+
+        x = self.input_proj(x)                          # (B, N, C_out)
+        seed = self.seed.expand(B, -1, -1)             # (B, 1, C_out)
+
+        attn_out = self.attn(
+            x_q=self.norm_seed(seed),
+            x_kv=self.norm_ctx(x)
+        )                                              # (B, 1, C_out)
+
+        x = seed + attn_out
+        x = x + self.mlp(self.norm2(x))                # (B, 1, C_out)
+
+        return x.squeeze(1)                            # (B, C_out)
+
 class CrossViewTransformerBlock(nn.Module):
-    """
-    Single layer of cross-attention from query (per-view predictions)
-    to key/value (all view encodings).
-    """
-    
     def __init__(self, dim, num_heads, dim_feedforward, dropout=0.1):
         super().__init__()
         
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        self.cross_attention = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
         
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -486,12 +359,6 @@ class CrossViewTransformerBlock(nn.Module):
         return query
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding for keypoint indices.
-    
-    Encodes the position/index of each keypoint in the sequence.
-    Can be extended to include per-camera positional information.
-    """
-    
     def __init__(self, embed_dim, max_seq_len=100):
         super().__init__()
         self.embed_dim = embed_dim
@@ -518,3 +385,87 @@ class PositionalEncoding(nn.Module):
             Positional encodings of same shape as x
         """
         return self.pe[:, :x.size(1), :]
+
+class RelativeTemporalEncoding(nn.Module):
+    """Learned embedding for a frame's signed offset from the target frame,
+    e.g. -10 ... 0 ... +10 for a 21-frame window."""
+    def __init__(self, embed_dim, max_offset=32):
+        super().__init__()
+        self.max_offset = max_offset
+        self.table = nn.Embedding(2 * max_offset + 1, embed_dim)
+
+    def forward(self, offsets: torch.Tensor):
+        idx = (offsets.clamp(-self.max_offset, self.max_offset) + self.max_offset).long()
+        return self.table(idx)
+
+
+class TemporalDecoderBlock(nn.Module):
+    """
+    One alternating-attention decoder block, matching the corrected design:
+
+      1) Self-attention: the N per-keypoint query tokens (representing every
+         keypoint of the center frame, occluded or not) self-attend TOGETHER
+         WITH the center frame's own contextualized visible tokens. This lets
+         occluded queries pull in full-detail, same-frame skeletal context
+         directly -- not compressed through a pooled latent.
+
+      2) Cross-attention: the same query tokens then cross-attend into a
+         compact TEMPORAL memory containing exactly one latent per OTHER
+         frame in the gathered window (tagged with that frame's relative
+         time offset). This gives cheap, long-range temporal context without
+         ever growing the memory beyond size T-1.
+
+    This is the direct analog of VGGT's alternating frame-wise/global
+    attention, adapted to keypoints: "frame-wise" here is full-detail
+    self-attention with the center frame's own tokens, and "global" is
+    cross-attention into other frames' compressed latents.
+    """
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, drop=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=drop, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=drop, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(drop),
+                                  nn.Linear(hidden, dim), nn.Dropout(drop))
+
+    def forward(self, queries, center_tokens, center_pad_mask, memory, memory_key_padding_mask=None):
+        """
+        Args:
+            queries: (B, N, D) one token per keypoint identity of the center frame
+            center_tokens: (B, V, D) center frame's own contextualized visible tokens
+            center_pad_mask: (B, V) bool, True = real (visible) token
+            memory: (B, T-1, D) per-OTHER-frame latents, already tagged with
+                their relative temporal offset
+            memory_key_padding_mask: (B, T-1) bool, True = valid frame
+
+        Returns:
+            queries: (B, N, D) updated query tokens
+        """
+        B, N, D = queries.shape
+        V = center_tokens.size(1)
+
+        # --- (1) Self-attention: queries + center frame's own visible tokens ---
+        combined = torch.cat([queries, center_tokens], dim=1)              # (B, N+V, D)
+        # True = position should be IGNORED as a key. Query slots are always
+        # valid; only padding among the center frame's visible tokens is masked.
+        key_padding_mask = torch.cat([
+            torch.zeros(B, N, dtype=torch.bool, device=queries.device),
+            ~center_pad_mask,
+        ], dim=1)                                                          # (B, N+V)
+
+        q = self.norm1(combined)
+        q2, _ = self.self_attn(q, q, q, key_padding_mask=key_padding_mask)
+        combined = combined + q2
+        queries = combined[:, :N]                                          # keep only query slots
+
+        # --- (2) Cross-attention: queries attend into other-frames' latents ---
+        q = self.norm2(queries)
+        cross_key_padding = ~memory_key_padding_mask if memory_key_padding_mask is not None else None
+        q2, _ = self.cross_attn(q, memory, memory, key_padding_mask=cross_key_padding)
+        queries = queries + q2
+
+        queries = queries + self.mlp(self.norm3(queries))
+        return queries

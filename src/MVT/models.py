@@ -31,11 +31,9 @@ class SpatialTransformerEncoder(nn.Module):
             - use_occlusion_mask: Whether to use occlusion masks
         num_keypoints (int): Number of keypoints (default 10)
         num_views (int): Number of camera views (default 3)
-        norm_layer: Normalization layer (default LayerNormXAI)
-        act_layer: Activation layer (default GELUActivationXAI)
     """
 
-    def __init__(self, conf, num_keypoints=10, num_views=3, norm_layer=LayerNormXAI, act_layer=GELUActivationXAI):
+    def __init__(self, conf, num_keypoints=10, num_views=3):
         super(SpatialTransformerEncoder, self).__init__()
 
         self.num_keypoints = num_keypoints
@@ -68,8 +66,6 @@ class SpatialTransformerEncoder(nn.Module):
                 qk_scale=self.qk_scale,
                 drop=self.drop_rate, 
                 attn_drop=self.attn_drop_rate, 
-                act_layer=act_layer, 
-                norm_layer=norm_layer,
             )
             for _ in range(self.depth - 1)
         ])
@@ -84,11 +80,9 @@ class SpatialTransformerEncoder(nn.Module):
             qk_scale=self.qk_scale, 
             drop=self.drop_rate, 
             attn_drop=self.attn_drop_rate, 
-            act_layer=act_layer, 
-            norm_layer=norm_layer
         )
         
-        self.last_norm = norm_layer(self.proj_dim) if conf['enable_last_norm'] else nn.Identity()
+        self.last_norm = nn.LayerNorm(self.proj_dim) if conf['enable_last_norm'] else nn.Identity()
         
         # Initialize weights
         self._reset_parameters()
@@ -252,6 +246,10 @@ class SpatialTransformerDecoder(nn.Module):
                     self.latent_dim
                 )
             self.depth_predictor = nn.Sequential(
+                nn.Linear(self.latent_dim, self.latent_dim),
+                nn.GELU(),
+                nn.Linear(self.latent_dim, self.latent_dim),
+                nn.GELU(),
                 nn.Linear(self.latent_dim, self.latent_dim // 2),
                 nn.GELU(),
                 nn.Dropout(self.dropout),
@@ -345,7 +343,9 @@ class SpatialTransformerDecoder(nn.Module):
         results['coordinates'] = keypoints_completed
 
         if self.output_confidence:
-            results['confidence']  = self.confidence_head(query_features) # (num_occluded_total, 1)
+            confidence_result = torch.ones((B,C,N,1), device=keypoints_completed.device)
+            confidence_result[batch_idx, view_idx, keypoint_idx] = self.confidence_head(query_features) # (num_occluded_total, 1)
+            results['confidence']  = confidence_result
 
         if self.predict_depth:
             depth_predictions = self.depth_predictor(query_features)  # (num_occluded_total, 1)
@@ -360,10 +360,10 @@ class SpatialTransformerDecoder(nn.Module):
     
 
 class MultiView3DKeypointModel(nn.Module):
-    def __init__(self, conf, num_keypoints=10, num_views=3, norm_layer=LayerNormXAI, act_layer=GELUActivationXAI):
+    def __init__(self, conf, num_keypoints=10, num_views=3):
         super().__init__()
 
-        self.encoder = SpatialTransformerEncoder(conf=conf['encoder'], num_keypoints=num_keypoints, num_views=num_views, norm_layer=norm_layer, act_layer=act_layer)
+        self.encoder = SpatialTransformerEncoder(conf=conf['encoder'], num_keypoints=num_keypoints, num_views=num_views)
         self.decoder = SpatialTransformerDecoder(conf=conf['decoder'], num_keypoints=num_keypoints, num_views=num_views)
 
     def forward(self, keypoints_2d, occlusion_mask, depth_map = None):
