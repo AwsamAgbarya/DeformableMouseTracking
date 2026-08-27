@@ -7,3 +7,4 @@ __pycache__
 src/constants/keys.py
 *ipynb
 wandb
+src/Dataset_analysis/plots/*

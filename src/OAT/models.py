@@ -573,7 +573,7 @@ class GlobalAttentionModel(nn.Module):
 
         return tokens, key_valid, kp_idx_flat, frame_idx_flat
 
-    def forward(self, keypoints_window, occlusion_window, frame_offsets, center_frame_idx):
+    def forward(self, keypoints_window, occlusion_window, frame_offsets):
         """
         Args:
             keypoints_window: (B, T, N, 3)
@@ -591,7 +591,7 @@ class GlobalAttentionModel(nn.Module):
                 bond_aux_pred: (B, N, bond_aux_dim) [only if predict_bond_aux=True]
         """
         B, T, N, _ = keypoints_window.shape
-
+        center_frame_idx = T // 2
         tokens, key_valid, kp_idx_flat, frame_idx_flat = self.build_tokens(keypoints_window, occlusion_window, frame_offsets)
 
         key_invalid = ~key_valid  # (B, T*N)

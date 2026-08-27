@@ -1,60 +1,38 @@
 import torch
-    
-def extract_poses(rigid_coords, deformable_coords, body_parts, reference_parts=("head center", "tail base"), pose_threshold=0.01, n_rotations=18):
-    body_parts_map = {part: idx for idx, part in enumerate(body_parts)}
-    rigid_coords = torch.tensor(rigid_coords, dtype=torch.float32)
-    deformable_coords = torch.tensor(deformable_coords, dtype=torch.float32)
+import numpy as np
 
-    # Compute Headings of reference vector
-    part1, part2 = reference_parts
-    T = rigid_coords.shape[0]
-    if (part1 not in body_parts_map) or (part2 not in body_parts_map):
-        headings = torch.eye(3, dtype=torch.float32).unsqueeze(0).repeat(T, 1, 1)
-    else:
-        i1 = body_parts_map[part1]
-        i2 = body_parts_map[part2]
+# Forward direction function (approximate based on shoulder blade joints)
+def forward_facing(data, LR_joint_indices, forward_sign=1):
+    li, ri = LR_joint_indices
+    hip_vec = data[:, ri, :2] - data[:, li, :2]  # (T, 2)
+    if isinstance(data, torch.Tensor):
+        forward_vec = torch.stack([-hip_vec[:, 1], hip_vec[:, 0]], dim=1) * forward_sign
+        norms = torch.linalg.norm(forward_vec, axis=1, keepdims=True)
+    elif isinstance(data, np.ndarray):   
+        forward_vec = np.stack([-hip_vec[:, 1], hip_vec[:, 0]], axis=1) * forward_sign
+        norms = np.linalg.norm(forward_vec, axis=1, keepdims=True)
+    norms[norms < 1e-9] = 1.0
+    forward_vec = forward_vec / norms
+    return forward_vec, norms
 
-        x1 = rigid_coords[:, i1, 0]
-        y1 = rigid_coords[:, i1, 1]
-        x2 = rigid_coords[:, i2, 0]
-        y2 = rigid_coords[:, i2, 1]
-
-        dx = x2 - x1
-        dy = y2 - y1
-
-        angles = torch.atan2(dy, dx)
-        neg_angles = -angles
-        cos_a = torch.cos(neg_angles)
-        sin_a = torch.sin(neg_angles)
-
-        norm_sq = dx * dx + dy * dy
-        valid = (norm_sq > 1e-12) & torch.isfinite(norm_sq)
-
-        cos_a = torch.where(valid, cos_a, torch.ones_like(cos_a))
-        sin_a = torch.where(valid, sin_a, torch.zeros_like(sin_a))
-
-        R = torch.zeros((T, 3, 3), dtype=torch.float32)
-        R[:, 2, 2] = 1.0
-        R[:, 0, 0] = cos_a
-        R[:, 0, 1] = -sin_a
-        R[:, 1, 0] = sin_a
-        R[:, 1, 1] = cos_a
-
-        headings = R
-
-    com = rigid_coords.mean(dim=1, keepdim=True)  # (n_frames, 1, 3)
-
-    # Rotate in place
-    deformable_centered = deformable_coords[:, :, 2:] - com
-    deformable_aligned = torch.einsum('fij,fpj->fpi', headings, deformable_centered)
+def extract_poses(local_coords, reference_indices=(8,11), pose_threshold=0.01, n_rotations=18):
+    local_coords = torch.tensor(local_coords, dtype=torch.float32)
+    # Get forward direction of the body
+    forward_vecs, norms = forward_facing(local_coords, reference_indices)
+    # Get angles from axes
+    theta = np.arctan2(forward_vecs[:, 1], forward_vecs[:, 0])
+    c, s = np.cos(-theta), np.sin(-theta)
+    # Remove rotation
+    gx, gy = local_coords[..., 0].clone(), local_coords[..., 1].clone()
+    local_coords[..., 0] = c[:, None] * gx - s[:, None] * gy
+    local_coords[..., 1] = s[:, None] * gx + c[:, None] * gy
 
     # Find unique poses
-    unique_indices = find_unique_poses(deformable_aligned, threshold=pose_threshold)
-    unique_poses = deformable_aligned[unique_indices]
-    com = com[unique_indices]
-    print(f"Found {len(unique_poses)} unique poses from {len(deformable_aligned)} frames")
-    final_poses = augment_dataset_with_rotation(unique_poses, com, n_rotations)
-    return unique_poses, com, final_poses   
+    unique_indices = find_unique_poses(local_coords, threshold=pose_threshold)
+    unique_poses = local_coords[unique_indices]
+    print(f"Found {len(unique_poses)} unique poses from {len(local_coords)} frames")
+    final_poses = augment_dataset_with_rotation(unique_poses, n_rotations)
+    return unique_poses, final_poses   
 
 def find_unique_poses(poses, threshold=0.01):
     """
@@ -64,7 +42,8 @@ def find_unique_poses(poses, threshold=0.01):
     """
     N = poses.shape[0]
     kept_indices = [0]
-    flat_poses = poses.view(N, -1)  # (N, P*3)
+    print(poses.shape)
+    flat_poses = poses.reshape(N, -1)  # (N, P*3)
     
     for i in range(1, N):
         current = flat_poses[i:i+1]
@@ -75,7 +54,7 @@ def find_unique_poses(poses, threshold=0.01):
             kept_indices.append(i)
     return torch.tensor(kept_indices)
 
-def augment_dataset_with_rotation(unique_poses, unique_com, n_rotations):
+def augment_dataset_with_rotation(unique_poses, n_rotations):
     # Augment each unique pose with random rotations
     augmented_poses = []
 
@@ -95,9 +74,7 @@ def augment_dataset_with_rotation(unique_poses, unique_com, n_rotations):
         augmented_poses.append(rotated_poses)
     
     augmented_poses = torch.stack(augmented_poses).view(-1, *unique_poses.shape[1:])  # (n_unique * n_rotations, part_count, 3)
-    com_expanded = unique_com.repeat_interleave(n_rotations, dim=0)
-    final_poses = augmented_poses + com_expanded
-    return final_poses
+    return augmented_poses
 
 def get_stratified_angles(n_rotations):
     """

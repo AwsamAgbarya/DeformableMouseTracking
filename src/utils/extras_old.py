@@ -344,3 +344,46 @@ class BAAnalyzer:
     def _check_evaluated(self):
         if not self.evaluated:
             raise RuntimeError("Call .evaluate() first.")
+
+# def flag_outlier_frames(rigid_coords, part_names=DEFAULT_PART_NAMES, reference_edge=[9,12], window=5, thresh_deg=90.0):
+#     """
+#     Flag frames where the reference bone undergoes an implausibly sharp direction change, indicating a tracking swap or identity flip.
+
+#     Returns
+#     -------
+#     outlier_mask  : BoolTensor (T,)        True = outlier frame
+#     angles        : Tensor (T,)            smoothed per-frame direction-change angle
+#     report        : str                    human-readable summary
+#     """
+#     p_idx, c_idx = reference_edge
+#     T = rigid_coords.shape[0]
+#     unit_vec = forward_facing(rigid_coords, reference_edge, forward_sign=1)
+
+#     # Angle between consecutive frames (dot product → degrees)
+#     cos_sim  = (unit_vec[1:] * unit_vec[:-1]).sum(dim=-1).clamp(-1.0, 1.0)
+#     raw_angles = torch.acos(cos_sim) * (180.0 / torch.pi)
+#     raw_angles = torch.cat([torch.zeros(1), raw_angles])
+#     outlier_mask = raw_angles > thresh_deg
+ 
+#     p_name   = part_names[p_idx]
+#     c_name   = part_names[c_idx]
+#     n_out    = outlier_mask.sum().item()
+#     out_idxs = outlier_mask.nonzero(as_tuple=True)[0].tolist()
+#     out_preview = out_idxs[:10]
+#     preview_str = ", ".join(str(f) for f in out_preview)
+#     if len(out_idxs) > 10:
+#         preview_str += f" ... (+{len(out_idxs)-10} more)"
+#     if outlier_mask.sum().item()==0:
+#         print("No outliers in the data")
+#         return outlier_mask
+#     report = (
+#         f"Reference bone : {p_name} → {c_name}\n"
+#         f"Threshold       : {thresh_deg}°  |  smoothing window: {window}\n"
+#         f"Total frames    : {T}\n"
+#         f"Outlier frames  : {n_out}  ({100*n_out/T:.1f}%)\n"
+#         f"Frame indices   : [{preview_str}]\n"
+#         f"Max Outlier angle seen  : {raw_angles.max().item():.1f}°  (frame {raw_angles.argmax().item()})\n"
+#         f"Min Outlier angle seen  : {raw_angles[outlier_mask].min().item():.1f}°  (frame {raw_angles[outlier_mask].argmin().item()})\n"
+#     )
+#     print(report)
+#     return outlier_mask

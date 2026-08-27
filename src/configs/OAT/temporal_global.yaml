@@ -9,7 +9,7 @@ train_dataset:
   file_path: "../data/glob3DBodyParts.csv"
   # load_norm_path:
   # save_norm_path: 
-  T_half: 15
+  T_half: 30
   outlier_window: 1
   outlier_thresh: 90.0
   normalize: True
@@ -22,7 +22,7 @@ train_dataset:
 
 validation_dataset:
   file_path: "../data/track_1_random_seed_change.csv"
-  T_half: 15
+  T_half: 30
   outlier_window: 1
   outlier_thresh: 90.0
   normalize: True
@@ -81,28 +81,20 @@ training:
     min_delta: 1.0e-4
 
 model:
-  encoder:
-    embed_dim: 256
-    depth: 4
-    num_heads: 8
-    mlp_ratio: 4.0
-    qkv_bias: true
-    qk_scale: null
-    drop_rate: 0.1
-    attn_drop_rate: 0.1
-    proj_dim: 256
-    enable_last_norm: true
-  decoder:
-    proj_dim: 256
-    window_size: 96
-    num_heads: 8
-    mlp_ratio: 4.0
-    decoder_dim_feedforward: 1024
-    decoder_dropout: 0.1
-    predict_uncertainty: true
-    predict_bond_aux: true
-    bond_aux_dim: 3
-    depth: 6
+  embed_dim: 256
+  depth: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  qkv_bias: true
+  qk_scale: null
+  drop_rate: 0.1
+  attn_drop_rate: 0.1
+  predict_uncertainty: true
+  predict_bond_aux: true
+  bond_aux_dim: 3
+  decoder_dim_feedforward: 1024
+  decoder_dropout: 0.1
+  enable_last_norm: true
 
 # Hydra configuration
 hydra:
