@@ -23,7 +23,7 @@ train_dataset:
   allow_dropped_center: False
   use_frame_conf: True
   canonicalization: window
-  tau_xy: 1.0
+  tau_xy: 2.0
   tau_yaw: 0.5
 
 validation_dataset:
@@ -43,7 +43,7 @@ validation_dataset:
   allow_dropped_center: False
   use_frame_conf: True
   canonicalization: window
-  tau_xy: 1.0
+  tau_xy: 2.0
   tau_yaw: 0.5
 
 masker:
