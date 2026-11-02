@@ -1,0 +1,43 @@
+eval:
+  calibration_seed: 0
+
+test_datasets:
+  test_1:
+    file_path: ../data/test1.csv
+    frames_file: ../data/test1_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+  test_2:
+    file_path: ../data/test2.csv
+    frames_file: ../data/test2_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+  test_3:
+    file_path: ../data/test3.csv
+    frames_file: ../data/test3_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+
+test_masker:
+  mode: world
+  occluder_rate_hz: 1.6
+  occluder_life_s: 3.0
+  occluder_life_sigma: 0.7
+  occluder_radius_sigma: 0.3
+  occluder_jitter: 0.5
+  occluder_speed_floor_mm_s: 20.0
+  frame_drop_rate_hz: 0.2
+  frame_drop_len_s: 0.40
+  min_visible_joints: 3
+  alpha: 1.0
+  alpha_rate: 1.0
+  alpha_radius: 0.0
+  target_ratio: 0.5
+  calibration_frames: 20000
+  max_corr_frames: 5000
+  curriculum:
+    enabled: False
+
+conditions:
+  standard:
+    seeds: [1001, 1002, 1003]

@@ -1,0 +1,143 @@
+
+defaults:
+  - eval_main
+  - _self_
+
+eval:
+  cache_root: ../eval_cache_ablations   
+  shared_root: ../eval_cache  
+  batch_size: 32                       
+  min_batch_size: 4
+  predictors: null                    
+  conditions: null                     
+  ablations: null 
+
+ckpt_root: ../checkpoints/OAT
+
+predictors:
+  # objective (temporal_32_s42 is the beta = 0.5 reference)
+  beta_0_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/beta_0_s42/best.pt
+    train_config: ${ckpt_root}/beta_0_s42/config.yaml
+  beta_1_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/beta_1_s42/best.pt
+    train_config: ${ckpt_root}/beta_1_s42/config.yaml
+  mse_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/mse_s42/best.pt
+    train_config: ${ckpt_root}/mse_s42/config.yaml
+
+  # encoder-decoder (STT) at four window lengths
+  temporal_8_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/temporal_8_s42/best.pt
+    train_config: ${ckpt_root}/temporal_8_s42/config.yaml
+    eval_batch_size: 32
+  temporal_16_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/temporal_16_s42/best.pt
+    train_config: ${ckpt_root}/temporal_16_s42/config.yaml
+    eval_batch_size: 32
+  temporal_32_s42: 
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/temporal_32_s42/best.pt
+    train_config: ${ckpt_root}/temporal_32_s42/config.yaml
+    eval_batch_size: 32
+  temporal_48_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/temporal_48_s42/best.pt
+    train_config: ${ckpt_root}/temporal_48_s42/config.yaml
+    eval_batch_size: 32
+
+  # global attention over every visible token of every frame
+  global_8_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/global_8_s42/best.pt
+    train_config: ${ckpt_root}/global_8_s42/config.yaml
+    eval_batch_size: 32
+  global_16_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/global_16_s42/best.pt
+    train_config: ${ckpt_root}/global_16_s42/config.yaml
+    eval_batch_size: 32
+  global_32_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/global_32_s42/best.pt
+    train_config: ${ckpt_root}/global_32_s42/config.yaml
+    eval_batch_size: 32
+  global_48_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/global_48_s42/best.pt
+    train_config: ${ckpt_root}/global_48_s42/config.yaml
+    eval_batch_size: 32
+
+  # trained with padded (non-full-context) windows
+  temporal_32_notfull_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ${ckpt_root}/temporal_32_notfull_s42/best.pt
+    train_config: ${ckpt_root}/temporal_32_notfull_s42/config.yaml
+
+
+ablations:
+  objective:
+    title: Training objective and uncertainty
+    reference: temporal_32_s42
+    conditions: [standard, hard, drop_heavy]
+    members:
+      beta_0_s42:      {label: "β = 0 (NLL)", beta: 0.0}
+      temporal_32_s42: {label: "β = 0.5", beta: 0.5}
+      beta_1_s42:      {label: "β = 1", beta: 1.0}
+      mse_s42:         {label: "MSE", beta: null, sigma: false}
+
+  context:
+    title: Window context length
+    reference: temporal_32_s42
+    conditions: [standard, hard, drop_heavy]
+    members:
+      temporal_8_s42:  {label: "H = 8", H: 8}
+      temporal_16_s42: {label: "H = 16", H: 16}
+      temporal_32_s42: {label: "H = 32", H: 32}
+      temporal_48_s42: {label: "H = 48", H: 48}
+
+  architecture:
+    title: Encoder-decoder vs global attention
+    reference: temporal_32_s42
+    conditions: [standard, drop_heavy]
+    members:
+      temporal_8_s42:  {label: "Enc-dec, H = 8", arch: encoder_decoder, H: 8}
+      temporal_16_s42: {label: "Enc-dec, H = 16", arch: encoder_decoder, H: 16}
+      temporal_32_s42: {label: "Enc-dec, H = 32", arch: encoder_decoder, H: 32}
+      temporal_48_s42: {label: "Enc-dec, H = 48", arch: encoder_decoder, H: 48}
+      global_8_s42:    {label: "Global, H = 8", arch: global, H: 8}
+      global_16_s42:   {label: "Global, H = 16", arch: global, H: 16}
+      global_32_s42:   {label: "Global, H = 32", arch: global, H: 32}
+      global_48_s42:   {label: "Global, H = 48", arch: global, H: 48}
+
+  full_context:
+    title: Training on padded windows
+    reference: temporal_32_s42
+    conditions: [standard, drop_heavy]            # drop_heavy: most padded windows
+    members:
+      temporal_32_s42:         {label: "full-context windows only", full_context_training: true}
+      temporal_32_notfull_s42: {label: "padded windows included", full_context_training: false}
+
+profile:
+  enabled: true
+  only: false                  
+  overwrite: false
+  predictors: null            
+  recording: test_1
+  condition: standard
+  seed: 1001
+  window_seed: 0            
+  batch_sizes: [1, 16, 64, 256]
+  n_warmup: 5
+  n_repeat: 20
+  flops: true       
+  flops_batch: 16
+  train_step: true  
+  train_batch_size: 64         
+  n_warmup_train: 3
+  n_repeat_train: 10

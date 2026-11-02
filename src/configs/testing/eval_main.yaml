@@ -1,0 +1,142 @@
+
+experiment:
+  seed: 0
+
+eval:
+  cache_root: ../eval_cache
+  device: auto                       
+  batch_size: 256                    
+  num_workers: 8
+  overwrite: false
+  save_inputs: false                 
+  save_raw: false                   
+  require_full_context: false        
+  allow_dropped_center: true         
+  calibration_seed: 0
+  timing_warmup_batches: 2           
+  fields_only: false
+  predictors: null                   
+  conditions: null                   
+
+reference:
+  train_dataset:
+    file_path: ../data/glob3DBodyParts.csv
+    frames_file: ../data/glob3DBodyParts_frames.csv
+    fps: 30
+    frame_estimator:
+      axis_pair: [tail_base, neck]
+      verbose: false
+      n_iter: 10
+      weight_clip: 100.0
+
+test_datasets:
+  test_1:
+    file_path: ../data/test1.csv
+    frames_file: ../data/test1_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+  test_2:
+    file_path: ../data/test2.csv
+    frames_file: ../data/test2_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+  test_3:
+    file_path: ../data/test3.csv
+    frames_file: ../data/test3_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+
+stt_window:
+  T_half: 32
+  max_radius: 64
+  tau_yaw: 0.5
+  tau_xy: 1.0
+  use_frame_conf: true
+  canonicalization: window
+
+predictors:
+  TP: 
+    _target_: evaluation.predictors.TemplatePredictor
+    window: ${stt_window}
+  LI: 
+    _target_: evaluation.predictors.LinearInterpPredictor
+    window: ${stt_window}
+  BFI:
+    _target_: evaluation.predictors.BodyFrameInterpPredictor
+    window: ${stt_window}
+  NN: 
+    _target_: evaluation.predictors.NearestNeighbourPredictor
+    k: 8  
+    align: se2
+    db_stride: 1
+    max_db: 100000
+    window: ${stt_window}
+
+  ST:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ../checkpoints/OAT/no_temporal_s42/best.pt
+    train_config: ../checkpoints/OAT/no_temporal_s42/config.yaml
+  TCNN:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ../checkpoints/OAT/tcn_s42/best.pt
+    train_config: ../checkpoints/OAT/tcn_s42/config.yaml
+
+  STT_s42:
+    _target_: evaluation.predictors.TemporalModelPredictor
+    checkpoint: ../checkpoints/OAT/temporal_32_s42/best.pt
+    train_config: ../checkpoints/OAT/temporal_32_s42/config.yaml
+
+test_masker:
+  mode: world
+  occluder_rate_hz: 1.6
+  occluder_life_s: 3.0
+  occluder_life_sigma: 0.7
+  occluder_radius_sigma: 0.3
+  occluder_jitter: 0.5
+  occluder_speed_floor_mm_s: 20.0
+  frame_drop_rate_hz: 0.2
+  frame_drop_len_s: 0.40
+  min_visible_joints: 3
+  alpha: 1.0
+  alpha_rate: 1.0
+  alpha_radius: 0.0
+  target_ratio: 0.5
+  calibration_frames: 20000
+  max_corr_frames: 5000
+  curriculum:
+    enabled: false
+
+conditions:
+  easy:
+    masker: {target_ratio: 0.2}
+    seeds: [1001, 1002, 1003]
+  standard:
+    seeds: [1001, 1002, 1003]
+  hard:
+    masker: {target_ratio: 0.7}
+    seeds: [1001, 1002, 1003]
+  extreme:
+    masker: {target_ratio: 0.85}
+    seeds: [1001, 1002, 1003]
+  sweep:                             
+    sweep_ratios: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    seeds: [1001]
+  long_occ:                          
+    masker:
+      occluder_life_s: 9.0
+    seeds: [1001, 1002, 1003]
+  drop_heavy:                        
+    masker:
+      frame_drop_rate_hz: 0.6        
+      frame_drop_len_s: 1.0          
+    seeds: [1001, 1002, 1003]
+  iid:                               
+    masker:                          
+      mode: iid
+    seeds: [1001, 1002, 1003]
+
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false

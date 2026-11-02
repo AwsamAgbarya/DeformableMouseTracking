@@ -1,0 +1,173 @@
+# @package _global_
+experiment:
+  project: DeformableMouse
+  name: no_temporal
+  description: "Tier 1 L1_H0: Single-frame network (L1 = A7 at H = 0)"
+  type: oat_temporal
+  seed: 42
+
+train_dataset:
+  file_path: "../data/glob3DBodyParts.csv"
+  frames_file: "../data/glob3DBodyParts_frames.csv"
+  fps: 30
+  frame_estimator:
+    axis_pair: ["tail_base", "neck"]
+    verbose: True
+    n_iter: 10
+    weight_clip: 100.0
+  # Wrapper
+  T_half: 0
+  max_radius: 0
+  seed: ${experiment.seed}
+  require_full_context: False
+  allow_dropped_center: False
+  use_frame_conf: True
+  canonicalization: window
+  tau_xy: 1.0
+  tau_yaw: 0.5
+
+validation_dataset:
+  file_path: "../data/valid.csv"
+  frames_file: "../data/valid_frames.csv"
+  fps: 30
+  frame_estimator:
+    axis_pair: ["tail_base", "neck"]
+    verbose: False
+    n_iter: 10
+    weight_clip: 100.0
+  # Wrapper
+  T_half: 0
+  max_radius: 0
+  seed: 43
+  require_full_context: False
+  allow_dropped_center: False
+  use_frame_conf: True
+  canonicalization: window
+  tau_xy: 1.0
+  tau_yaw: 0.5
+
+masker:
+  mode: world
+  # world occluders
+  occluder_rate_hz: 1.6
+  occluder_life_s: 3.0
+  occluder_life_sigma: 0.7
+  occluder_radius_sigma: 0.3
+  occluder_jitter: 0.5
+  occluder_speed_floor_mm_s: 20.0
+  # whole-frame drops
+  frame_drop_rate_hz: 0.2
+  frame_drop_len_s: 0.40
+  min_visible_joints: 3
+  # Amplification
+  alpha: 1.0
+  alpha_rate: 1.0
+  alpha_radius: 0.0
+  # Calibration
+  calibration_frames: 20000
+  max_corr_frames: 5000
+  curriculum:
+    enabled: True
+    ratio_min: 0.4
+    ratio_max: 0.7
+    warmup_epochs: 50
+
+val_masker:
+  mode: world
+  # world occluders
+  occluder_rate_hz: 1.6
+  occluder_life_s: 3.0
+  occluder_life_sigma: 0.7
+  occluder_radius_sigma: 0.3
+  occluder_jitter: 0.5 # centre offset from the anchor joint, as a fraction of the blob radius
+  occluder_speed_floor_mm_s: 20.0
+  # whole-frame drops
+  frame_drop_rate_hz: 0.2
+  frame_drop_len_s: 0.40
+  min_visible_joints: 3
+  # Amplification
+  alpha: 1.0
+  alpha_rate: 1.0
+  alpha_radius: 0.0
+  target_ratio: 0.7
+  # Calibration
+  calibration_frames: 20000
+  max_corr_frames: 5000
+  curriculum:
+    enabled: False
+
+model:
+  type: transformer
+  encoder:
+    embed_dim: 256
+    depth: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+    qkv_bias: true
+    qk_scale: null
+    drop_rate: 0.1
+    attn_drop_rate: 0.1
+    proj_dim: 256
+    enable_last_norm: true
+  decoder:
+    proj_dim: 256
+    num_heads: 8
+    mlp_ratio: 4.0
+    decoder_dim_feedforward: 1024
+    decoder_dropout: 0.1
+    predict_uncertainty: true
+    depth: 6
+    block_type: alternating
+    center_mode: tokens
+    relpose_embedding: false
+
+loss:
+  main_loss: 'l2'
+  use_uncertainty: True
+  lambda_main: 1.0
+  axis_weights: [1.0, 1.0, 1.0]
+  eps: 1e-6
+  log_sigma_clamp: [-8.0, 3.0]
+  huber_beta: 0.05
+  beta_nll: 0.5
+
+training:
+  run_name: ${experiment.name}_s${experiment.seed}
+  checkpoint_root: ../checkpoints/OAT/
+  epochs: 300
+  amp: bf16
+  grad_clip_norm: 1.0
+  grad_accum_steps: 1
+  log_interval: 100
+  checkpoint_interval: 5
+  visualize_interval: 10
+  resume_from: null
+  dataloader:
+    batch_size: 64
+    num_workers: 8
+  optimizer:
+    lr: 3.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+  scheduler:
+    warmup_frac: 0.03
+    min_lr_ratio: 0.01
+  ema:
+    enabled: true
+    decay: 0.999
+    warmup: 1000
+  early_stopping:
+    enabled: true
+    patience: 25
+    min_delta: 1.0e-4
+    monitor: metric/mpjpe_mm
+  seed: ${experiment.seed}
+  use_wandb: True
+  wandb_project: oat-mouse-keypoints
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false

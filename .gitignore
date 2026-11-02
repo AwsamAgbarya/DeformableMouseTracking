@@ -4,7 +4,12 @@ checkpoints
 data
 __pycache__
 *.log
-src/constants/keys.py
 *ipynb
 wandb
-src/Dataset_analysis/plots/*
+src/analysis/
+constants
+src/evaluation
+eval_cache
+eval_cache_ablations
+eval_cache_nn
+eval_results

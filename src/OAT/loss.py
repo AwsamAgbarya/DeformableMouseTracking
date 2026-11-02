@@ -1,117 +1,125 @@
+"""
+Loss for the temporal (windowed) occlusion-aware model.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ModularKeypointLoss(nn.Module):
+class TemporalKeypointLoss(nn.Module):
     """
-    Modular multi-task loss for masked keypoint prediction.
+    pred (from TemporalModel)
+        coordinates   (B, N, 3)   required   observation where visible, prediction where not
+        log_sigma     (B, N, 3)   optional   per-axis log sigma
 
-    Main task:
-        Masked coordinate regression (deformable 3D keypoints, normalized).
-        Optionally re-weighted by predicted per-keypoint uncertainty
-        (log-sigma parameterization), applied ONLY to occluded/masked points.
-
-    Auxiliary tasks (each independently toggle-able via `config`):
-        - use_uncertainty:   sigma = exp(log_sigma)
-                              loss = residual/sigma + alpha*log_sigma
-                              (inverse-confidence: higher predicted uncertainty
-                              DISCOUNTS the residual penalty -> divide, not multiply)
-        - use_relative_dist: masked regression on relative-distance features
-                              (e.g. rigid<->deformable offset / bond length/vector)
-
-    All losses are computed ONLY over points flagged occluded in the mask.
-    Non-occluded points are treated as ground truth and never contribute,
-    regardless of what the model happens to output there.
-
-    Expected `pred` dict keys (all optional except 'coordinates'):
-        coordinates : (B, N, 3)              predicted deformable coords
-        log_sigma   : (B, N, 3)  [optional]  predicted log-uncertainty
-        rel_dist    : (B, N, D)  [optional]  predicted relative-distance feature
-
-    Expected `target` dict keys:
-        coordinates   : (B, N, 3)             GT deformable coords
-        occluded_mask : (B, N) or (B, N, 1)   bool, True == occluded == used in loss
-        rel_dist      : (B, N, D) [optional]  GT relative-distance feature
+    target (from the trainer's `_build_targets`)
+        coordinates   (B, N, 3)   required   batch['target_coords']
+        occluded_mask (B, N)      required   ~batch['center_vis'], True = scored
     """
 
-    def __init__(self, config = None):
+    def __init__(self, config=None, scale_mm=1.0):
         super().__init__()
-        config = config or {}
+        cfg = dict(config or {})
+        self.cfg = cfg
 
-        # ---- per-task toggles -----------------------------------------
-        self.use_uncertainty = config.get("use_uncertainty", False)
-        self.use_relative_dist = config.get("use_relative_dist", False)
+        self.main_loss = cfg.get("main_loss", "l2")              # l2 | l1 | huber
+        self.use_uncertainty = bool(cfg.get("use_uncertainty", True))
 
-        # ---- loss shape ------------------------------------------------
-        self.main_loss_type = config.get("main_loss_type", "l2")       # 'l1' | 'l2' | 'smooth_l1'
-        self.reldist_loss_type = config.get("reldist_loss_type", "l1")
+        self.lambda_main = float(cfg.get("lambda_main", 1.0))
+        self.beta = float(self.cfg.get("beta_nll", 0.5))
+        
+        aw = cfg.get("axis_weights", (1.0, 1.0, 1.0))
+        self.register_buffer("axis_weights", torch.tensor(aw, dtype=torch.float32))
 
-        # ---- weights -----------------------------------------------------
-        self.lambda_main = config.get("lambda_main", 1.0)
-        self.lambda_uncertainty_reg = config.get("lambda_uncertainty_reg", 1.0)  # alpha
-        self.lambda_reldist = config.get("lambda_reldist", 1.0)
+        self.eps = float(cfg.get("eps", 1e-6))
+        self.log_sigma_clamp = tuple(cfg.get("log_sigma_clamp", (-8.0, 3.0)))
+        self.huber_beta = float(cfg.get("huber_beta", 0.05))
+        self.scale_mm = float(scale_mm)
 
-        self.eps = config.get("eps", 1e-6)
-        self.log_sigma_clamp = config.get("log_sigma_clamp", (-7.0, 7.0))  # numerical safety
-
-    @staticmethod
-    def _prep_mask(mask):
-        """Collapse (B,N,1) -> (B,N) and cast to bool."""
-        if mask.dim() == 3:
-            mask = mask[..., 0]
-        return mask.bool()
+    # helpers
 
     @staticmethod
-    def _elementwise_residual(pred, gt, loss_type):
-        if loss_type == "l1":
-            return F.l1_loss(pred, gt, reduction="none")
-        elif loss_type == "l2":
-            return F.mse_loss(pred, gt, reduction="none")
-        elif loss_type == "smooth_l1":
-            return F.smooth_l1_loss(pred, gt, reduction="none")
-        else:
-            raise ValueError(f"Unknown loss_type: {loss_type}")
+    def _as_mask(m):
+        if m.dim() == 3:
+            m = m[..., 0]
+        return m.bool()
 
-    def _masked_mean(self, residual, mask):
-        """
-        residual: (B, N, D) elementwise loss
-        mask:     (B, N) bool, True = include
-        Mean over masked (points x dims); safe (zero, no NaN) if mask is all-False.
-        """
-        mask_exp = mask.unsqueeze(-1).expand_as(residual)
-        n_valid = mask_exp.sum()
-        if n_valid == 0:
-            return residual.sum() * 0.0  # keeps dtype/device/graph, contributes zero
-        return (residual * mask_exp).sum() / (n_valid + self.eps)
+    def _elementwise(self, pred, gt):
+        if self.main_loss == "l1":
+            return (pred - gt).abs()
+        if self.main_loss == "l2":
+            return (pred - gt).pow(2)
+        if self.main_loss == "huber":
+            return F.smooth_l1_loss(pred, gt, reduction="none", beta=self.huber_beta)
+        raise ValueError(f"Unknown main_loss: {self.main_loss}")
+
+    @staticmethod
+    def _masked_mean(residual, mask):
+        """residual (B, N, D) or (B, N); mask (B, N) bool. Zero-safe."""
+        m = mask.unsqueeze(-1) if residual.dim() == mask.dim() + 1 else mask
+        m = m.to(residual.dtype).expand_as(residual)
+        n = m.sum()
+        if n == 0:
+            return residual.sum() * 0.0
+        return (residual * m).sum() / n
+
+    # forward
 
     def forward(self, pred, target):
-        mask = self._prep_mask(target["occluded_mask"])  # (B, N) True = occluded = used
+        occluded = self._as_mask(target["occluded_mask"])
+        coords_p, coords_t = pred["coordinates"], target["coordinates"]
+        losses, metrics = {}, {}
 
-        losses = {}
-        residual = self._elementwise_residual(pred["coordinates"], target["coordinates"], self.main_loss_type)  # (B, N, 3)
+        # main
+        res = self._elementwise(coords_p, coords_t) * self.axis_weights.view(1, 1, 3)
 
         if self.use_uncertainty and "log_sigma" in pred:
             log_sigma = pred["log_sigma"].clamp(*self.log_sigma_clamp)
-            sigma = torch.exp(log_sigma)
-            # inverse-confidence: divide by sigma (not Sigma-odot-residual)
-            weighted_residual = residual / (sigma + self.eps) + self.lambda_uncertainty_reg * log_sigma
-            main_loss = self._masked_mean(weighted_residual, mask)
-            losses["coord_raw"] = self._masked_mean(residual, mask).detach()  # monitoring only
+            if self.main_loss == "l2":
+                nll = 0.5 * res * torch.exp(-2.0 * log_sigma) + log_sigma
+            else:
+                nll = res * torch.exp(-log_sigma) + log_sigma
+            if self.beta > 0:
+                nll = nll * torch.exp(2.0 * self.beta * log_sigma).detach()
+            main = self._masked_mean(nll, occluded)
+            losses["coord_nll"] = main
+            losses["coord_raw"] = self._masked_mean(res, occluded).detach()
+            with torch.no_grad():
+                z2 = (res * torch.exp(-2.0 * log_sigma))          # (e/σ)² per axis
+                metrics["calib_z2"]     = self._masked_mean(z2, occluded)      # should be ≈ 1.0
+                metrics["nll_quad"]     = 0.5 * metrics["calib_z2"]
+                metrics["nll_logsig"]   = self._masked_mean(log_sigma, occluded)
+                metrics["logsig_std"]   = log_sigma[occluded].std()      
         else:
-            main_loss = self._masked_mean(residual, mask)
+            main = self._masked_mean(res, occluded)
+            losses["coord"] = main
 
-        losses["weighted_coord"] = main_loss
+        total = self.lambda_main * main
 
-        if self.use_relative_dist and "rel_dist" in pred and "rel_dist" in target:
-            reldist_residual = self._elementwise_residual(pred["rel_dist"], target["rel_dist"], self.reldist_loss_type)
-            losses["relative_dist"] = self._masked_mean(reldist_residual, mask)
-        else:
-            losses["relative_dist"] = torch.zeros((), device=pred["coordinates"].device)
-
-        total = self.lambda_main * losses["weighted_coord"]
-        if self.use_relative_dist:
-            total = total + self.lambda_reldist * losses["relative_dist"]
+        # metrics
+        with torch.no_grad():
+            err = torch.linalg.norm(coords_p - coords_t, dim=-1)           # (B, N)
+            n = occluded.sum()
+            metrics["mpjpe_mm"] = (
+                (err * occluded).sum() / n * self.scale_mm if n > 0 else err.sum() * 0.0
+            )
+            if n > 0:
+                sel = err[occluded]
+                metrics["pjpe_p90_mm"] = sel.quantile(0.90) * self.scale_mm
+                metrics["occluded_frac"] = occluded.float().mean()
+                ax = (coords_p - coords_t).pow(2)[occluded].mean(0).sqrt() * self.scale_mm
+                metrics["rmse_x_mm"], metrics["rmse_y_mm"], metrics["rmse_z_mm"] = ax[0], ax[1], ax[2]
+                if self.use_uncertainty and "log_sigma" in pred and sel.numel() > 2:
+                    # Is the predicted sigma informative, or is it just a
+                    # constant? Correlation between predicted log sigma and the
+                    # realized log error; a useful head scores well above 0.
+                    ls = pred["log_sigma"].clamp(*self.log_sigma_clamp).mean(-1)[occluded]
+                    le = torch.log(sel + self.eps)
+                    lsc, lec = ls - ls.mean(), le - le.mean()
+                    metrics["sigma_err_corr"] = (lsc * lec).sum() / (
+                        lsc.norm() * lec.norm()).clamp_min(self.eps)
 
         losses["total"] = total
+        losses.update({f"metric/{k}": v for k, v in metrics.items()})
         return losses

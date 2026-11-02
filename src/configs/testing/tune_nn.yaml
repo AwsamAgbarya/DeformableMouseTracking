@@ -1,0 +1,83 @@
+
+experiment:
+  seed: 0
+
+eval:
+  cache_root: ../eval_cache_nn       
+  device: auto
+  batch_size: 256
+  num_workers: 8
+  overwrite: false
+  save_inputs: false
+  save_raw: false
+  require_full_context: false
+  allow_dropped_center: true
+  calibration_seed: 0
+  timing_warmup_batches: 2
+  fields_only: false
+
+reference:
+  train_dataset:
+    file_path: ../data/glob3DBodyParts.csv
+    frames_file: ../data/glob3DBodyParts_frames.csv
+    fps: 30
+    frame_estimator:
+      axis_pair: [tail_base, neck]
+      verbose: false
+      n_iter: 10
+      weight_clip: 100.0
+
+test_datasets:
+  valid:
+    file_path: ../data/valid.csv
+    frames_file: ../data/valid_frames.csv
+    fps: 30
+    pose_threshold: 0.0
+
+stt_window:
+  T_half: 32
+  max_radius: 64
+  tau_yaw: 0.5
+  tau_xy: 1.0
+  use_frame_conf: true
+  canonicalization: window
+
+predictors:
+  NN_k1:  {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 1,  align: se2, window: "${stt_window}"}
+  NN_k2:  {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 2,  align: se2, window: "${stt_window}"}
+  NN_k4:  {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 4,  align: se2, window: "${stt_window}"}
+  NN_k8:  {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 8,  align: se2, window: "${stt_window}"}
+  NN_k16: {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 16, align: se2, window: "${stt_window}"}
+  NN_k32: {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 32, align: se2, window: "${stt_window}"}
+  NN_k64: {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 64, align: se2, window: "${stt_window}"}
+  NN_k8_translation: {_target_: evaluation.predictors.NearestNeighbourPredictor, k: 8, align: translation, window: "${stt_window}"}
+
+test_masker:
+  mode: world
+  occluder_rate_hz: 1.6
+  occluder_life_s: 3.0
+  occluder_life_sigma: 0.7
+  occluder_radius_sigma: 0.3
+  occluder_jitter: 0.5
+  occluder_speed_floor_mm_s: 20.0
+  frame_drop_rate_hz: 0.2
+  frame_drop_len_s: 0.40
+  min_visible_joints: 3
+  alpha: 1.0
+  alpha_rate: 1.0
+  alpha_radius: 0.0
+  target_ratio: 0.5
+  calibration_frames: 20000
+  max_corr_frames: 5000
+  curriculum:
+    enabled: false
+
+conditions:
+  standard:
+    seeds: [1001]
+
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false

@@ -1,32 +1,31 @@
 import torch
 from torch import nn
-from utils.modules import GlobalAttentionPoolingBlock, TransformerBlock, PositionalEncoding, TemporalDecoderBlock, RelativeTemporalEncoding
+from OAT.modules import GlobalAttentionPoolingBlock, TransformerBlock, GlobalSelfAttentionBlock, TemporalDecoderBlock, RelativeTemporalEncoding, GlobalDecoderBlock
+
+def _mlp_head(dim, hidden, out_dim, drop=0.0):
+    return nn.Sequential(
+        nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(drop), nn.Linear(hidden, out_dim)
+    )
+
 
 class SnapshotEncoder(nn.Module):
     """
     Per-frame encoder. Embeds visible keypoints, contextualizes them via
-    self-attention among themselves (masking out occluded points as keys),
-    and pools them into a single compact per-frame latent.
+    self-attention among themselves (occluded points are never embedded at all,
+    so there is no path for a hidden coordinate to leak in), and pools them into
+    a single compact per-frame latent.
 
     Also optionally returns the raw contextualized per-keypoint tokens.
-    This distinction is central to the fixed design:
-      - The CENTER frame needs its per-keypoint tokens (return_tokens=True),
-        so the decoder can let occluded center-frame queries directly
-        self-attend with the center frame's own visible keypoints --
-        full-detail, same-frame information, not compressed through a latent.
-      - Every OTHER (context) frame only needs its pooled latent
-        (return_tokens=False), which keeps the temporal cross-attention
-        memory to size T-1 (one token per frame) instead of (T-1)*N.
-        This is what makes the design efficient and matches the original
-        intended architecture: "one latent per frame" for temporal memory,
-        with only the center frame exposing raw token-level detail.
+    - The CENTER frame needs its per-keypoint tokens (return_tokens=True).
+    - Every OTHER (context) frame only needs its pooled latent, keeping the
+      temporal memory at size T-1.
 
     Args:
-        conf (dict): Configuration containing:
-            - embed_dim, depth, num_heads, mlp_ratio, qkv_bias, qk_scale,
-              drop_rate, attn_drop_rate, proj_dim, enable_last_norm
-        num_keypoints (int): Number of keypoints per frame (default 10)
+        conf (dict): embed_dim, depth, num_heads, mlp_ratio, qkv_bias, qk_scale,
+            drop_rate, attn_drop_rate, proj_dim, enable_last_norm, fast_pack
+        num_keypoints (int)
     """
+
     def __init__(self, conf, num_keypoints=10):
         super().__init__()
         self.num_keypoints = num_keypoints
@@ -41,12 +40,9 @@ class SnapshotEncoder(nn.Module):
         self.proj_dim = conf['proj_dim']
 
         self.keypoint_embed = nn.Linear(3, self.embed_dim)
-        # Learnable per-keypoint IDENTITY embedding (not sinusoidal positional
-        # encoding) -- keypoints have no natural ordinal relationship, so an
-        # embedding table that lets the model freely represent "which
-        # keypoint" is the right tool, consistent with the decoder's identity
-        # embeddings used elsewhere in this codebase.
         self.kp_identity_embed = nn.Embedding(num_keypoints, self.embed_dim)
+
+        self.no_evidence_token = nn.Parameter(torch.zeros(1, self.embed_dim))
 
         self.blocks = nn.ModuleList([
             TransformerBlock(
@@ -70,9 +66,46 @@ class SnapshotEncoder(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        nn.init.normal_(self.no_evidence_token, std=0.02)
 
     def get_num_layers(self):
         return len(self.blocks) + 2
+
+    def _pack_fast(self, x_embed, vis_mask):
+        """
+        Vectorized equivalent of `_pack_loop`.
+
+        A stable argsort on (~visible) puts the visible indices first in
+        ascending order, which is exactly the order boolean indexing produced,
+        so the packed tensors are identical element for element.
+        """
+        B, N, E = x_embed.shape
+        dev = x_embed.device
+
+        n_vis = vis_mask.sum(1)                                        # (B,)
+        V = max(int(n_vis.max()), 1)
+
+        order = torch.argsort((~vis_mask).to(torch.int8), dim=1, stable=True)[:, :V]
+        gathered = torch.gather(x_embed, 1, order.unsqueeze(-1).expand(B, V, E))
+
+        slot = torch.arange(V, device=dev).unsqueeze(0)                # (1, V)
+        pad_mask = slot < n_vis.unsqueeze(1)                           # (B, V)
+        padded = gathered * pad_mask.unsqueeze(-1).to(gathered.dtype)
+        kp_idx = torch.where(pad_mask, order, torch.full_like(order, -1))
+
+        # A frame with nothing visible (a dropped frame) gets the learned
+        # no-evidence token in slot 0, and that slot counts as real.
+        empty = (n_vis == 0)
+        if bool(empty.any()):
+            first = empty.unsqueeze(1) & (slot == 0)                   # (B, V)
+            padded = torch.where(
+                first.unsqueeze(-1),
+                self.no_evidence_token.view(1, 1, E).expand(B, V, E),
+                padded,
+            )
+            pad_mask = pad_mask | first
+        return padded, pad_mask, kp_idx
+
 
     def forward(self, x, occlusion_mask, return_tokens=False):
         """
@@ -83,10 +116,8 @@ class SnapshotEncoder(nn.Module):
                 tokens (needed only for the center frame)
 
         Returns:
-            latent: (B, proj_dim) pooled per-frame latent
-            [if return_tokens] hidden: (B, V, E) contextualized visible tokens
-            [if return_tokens] pad_mask: (B, V) bool, True = real token
-            [if return_tokens] kp_idx: (B, V) long, keypoint id per token (-1=pad)
+            latent: (B, proj_dim)
+            [if return_tokens] hidden: (B, V, E), pad_mask: (B, V), kp_idx: (B, V)
         """
         B, N, D = x.shape
         vis_mask = occlusion_mask[..., 0] if occlusion_mask.dim() == 3 else occlusion_mask
@@ -95,542 +126,440 @@ class SnapshotEncoder(nn.Module):
         kp_idx_all = torch.arange(N, device=x.device).unsqueeze(0).expand(B, N)
         x_embed = self.keypoint_embed(x) + self.kp_identity_embed(kp_idx_all)  # (B, N, E)
 
-        visible_list, kp_idx_list = [], []
-        for i in range(B):
-            m = vis_mask[i]
-            visible_list.append(x_embed[i, m])
-            kp_idx_list.append(torch.nonzero(m, as_tuple=True)[0])
+        padded, pad_mask, kp_idx = self._pack_fast(x_embed, vis_mask)
 
-        max_visible = max(max((v.size(0) for v in visible_list), default=0), 1)
-        padded = torch.zeros(B, max_visible, self.embed_dim, device=x.device, dtype=x_embed.dtype)
-        pad_mask = torch.zeros(B, max_visible, dtype=torch.bool, device=x.device)
-        kp_idx = torch.full((B, max_visible), -1, dtype=torch.long, device=x.device)
-        for i, v in enumerate(visible_list):
-            padded[i, :v.size(0)] = v
-            pad_mask[i, :v.size(0)] = True
-            kp_idx[i, :v.size(0)] = kp_idx_list[i]
-
-        # Only VISIBLE tokens are usable as attention KEYS. Padding slots are
-        # masked out for every query row, so they never contaminate context.
         key_invalid = ~pad_mask
-        attn_mask = torch.zeros(B, max_visible, max_visible, device=x.device, dtype=padded.dtype)
+        attn_mask = torch.zeros(B, padded.shape[1], padded.shape[1], device=x.device, dtype=padded.dtype)
         attn_mask.masked_fill_(key_invalid.unsqueeze(1), torch.finfo(padded.dtype).min)
 
         hidden = padded
         for block in self.blocks:
             hidden = block(hidden, attn_mask=attn_mask)
 
-        latent = self.last_norm(self.pool(hidden))
+        latent = self.last_norm(self.pool(hidden, pad_mask))
 
         if return_tokens:
             return latent, hidden, pad_mask, kp_idx
         return latent
 
-class SnapshotDecoder(nn.Module):
-    """
-    Decoder for single-view global 3D keypoint completion.
-
-    Inputs:
-        encoded_features: (B, D)        global latent from encoder
-        original_keypoints: (B, N, 3)   input 3D pose, with visible GT values
-        occlusion_mask: (B, N) or (B, N, 1), True = visible, False = occluded
-
-    Output:
-        dict with:
-            coordinates: (B, N, 3) completed pose
-            occluded_mask: (B, N) boolean mask of missing keypoints
-    """
-
-    def __init__(self, conf, num_keypoints=10):
-        super().__init__()
-
-        self.num_keypoints = num_keypoints
-        self.latentdim = conf["proj_dim"]
-        self.dropout = conf.get("decoder_dropout", 0.1)
-
-        hidden_dim = conf.get("decoder_dim_feedforward", self.latentdim * 2)
-
-        # One learnable query per keypoint identity
-        self.keypoint_queries = nn.Parameter(torch.randn(num_keypoints, self.latentdim))
-
-        # Positional encoding over keypoint index
-        self.pos_encoding = PositionalEncoding(self.latentdim, max_seq_len=num_keypoints)
-
-        # Fuse [query, latent] -> decoded keypoint feature
-        self.query_fuser = nn.Sequential(
-            nn.Linear(self.latentdim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(hidden_dim, self.latentdim),
-            nn.GELU(),
-        )
-
-        # Predict 3D coordinates
-        self.predictor = nn.Sequential(
-            nn.Linear(self.latentdim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 3),
-        )
-
-        self.init_weights()
-
-    def init_weights(self):
-        nn.init.normal_(self.keypoint_queries, std=0.02)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, encoded_features, original_keypoints, occlusion_mask):
-        """
-        Args:
-            encoded_features:   (B, D)
-            original_keypoints: (B, N, 3)
-            occlusion_mask:     (B, N) or (B, N, 1), True=visible, False=occluded
-
-        Returns:
-            dict:
-                coordinates:   (B, N, 3)
-                occluded_mask: (B, N)
-        """
-        B, N, D = original_keypoints.shape
-        assert D == 3, f"Expected 3D keypoints, got last dim {D}"
-        assert N == self.numkeypoints, f"Expected {self.numkeypoints} keypoints, got {N}"
-
-        if occlusion_mask.dim() == 3:
-            occlusion_mask = occlusion_mask[..., 0]
-        occlusion_mask = occlusion_mask.bool()
-
-        occluded_mask = ~occlusion_mask  # True where we need prediction
-
-        # Start from GT and only overwrite hidden points
-        completed_keypoints = original_keypoints.clone()
-
-        # Build per-keypoint query tokens with positional meaning
-        query_tokens = self.keypoint_queries.unsqueeze(0).expand(B, -1, -1)   # (B, N, D)
-        query_tokens = query_tokens + self.pos_encoding(query_tokens)          # (B, N, D)
-
-        # Broadcast latent to all keypoints
-        latent_tokens = encoded_features.unsqueeze(1).expand(B, N, -1)        # (B, N, D)
-
-        # Fuse keypoint identity query with global latent
-        decoded_features = self.query_fuser(
-            torch.cat([query_tokens, latent_tokens], dim=-1)
-        )                                                                     # (B, N, D)
-
-        # Only predict occluded joints
-        if occluded_mask.any():
-            pred_3d = self.predictor(decoded_features[occluded_mask])         # (num_occ, 3)
-            completed_keypoints[occluded_mask] = pred_3d
-
-        return {
-            "coordinates": completed_keypoints,
-            "occluded_mask": occluded_mask,
-        }
-
 class TemporalDecoder(nn.Module):
     """
-    Decodes every keypoint of the center frame (occluded ones get a genuine
-    prediction; visible ones are overwritten with ground truth at the end)
-    using a stack of TemporalDecoderBlocks that alternate:
+    Decodes every keypoint of the center frame using a stack of
+    TemporalDecoderBlocks that alternate:
       - full-detail self-attention with the center frame's own visible tokens
-      - efficient cross-attention into other frames' pooled temporal memory
+      - cross-attention into the other frames' pooled temporal memory
+    Single-frame decoder (H = 0)
 
-    Optional auxiliary heads (toggle via conf), applied only to occluded
-    center-frame queries:
-      - predict_uncertainty: per-keypoint aleatoric log-sigma (VGGT-style)
-      - predict_bond_aux: per-keypoint rigid-to-deform offset / bond length
+    conf flags:
+        predict_uncertainty -> log_sigma  (B, N, 3)
+        block_type          "alternating" (default, M0) | "global" (ablation A3a):
+                            one attention over [queries; center tokens; memory]
+                            per block instead of self- then cross-attention
+        relpose_embedding   False (default) | True (ablation A4c): each context
+                            frame's pose relative to the reference frame,
+                            (cos, sin, x, y), is linearly embedded and added to
+                            its memory slot
     """
+
+    BLOCK_TYPES = ("alternating", "global")
+
     def __init__(self, conf, num_keypoints=10, window_size=21, max_offset=96):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.center_idx = window_size // 2
+        self.temporal = window_size > 1
         dim = conf['proj_dim']
 
         self.predict_uncertainty = conf.get('predict_uncertainty', False)
-        self.predict_bond_aux = conf.get('predict_bond_aux', False)
-        self.bond_aux_dim = conf.get('bond_aux_dim', 3)
+        self.block_type = str(conf.get('block_type', 'alternating')).lower()
+        assert self.block_type in self.BLOCK_TYPES, \
+            f"decoder.block_type must be one of {self.BLOCK_TYPES}, got {self.block_type!r}"
+        self.use_relpose = bool(conf.get('relpose_embedding', False))
 
-        # One learnable query per keypoint IDENTITY (covers all N keypoints
-        # of the center frame, not just the occluded ones -- visible ones are
-        # simply overwritten with GT at the end, same as before).
         self.query_embed = nn.Parameter(torch.randn(num_keypoints, dim) * 0.02)
+        self.time_embed = RelativeTemporalEncoding(dim, max_offset=max_offset) if self.temporal else None
 
-        # Temporal encoding uses the REAL relative offset of each context
-        # frame from the center frame, so non-consecutive windows (nearest
-        # valid frames gathered from each direction) still get geometrically
-        # meaningful positions.
-        self.time_embed = RelativeTemporalEncoding(dim, max_offset=max_offset)
+        if self.block_type == "global":
+            self.blocks = nn.ModuleList([
+                GlobalDecoderBlock(dim, conf['num_heads'], conf['mlp_ratio'], conf.get('decoder_dropout', 0.1))
+                for _ in range(conf['depth'])
+            ])
+            self.type_embed = nn.Parameter(torch.randn(2, dim) * 0.02)    # [center token, memory]
+        else:
+            self.blocks = nn.ModuleList([
+                TemporalDecoderBlock(dim, conf['num_heads'], conf['mlp_ratio'], conf.get('decoder_dropout', 0.1),
+                                     temporal=self.temporal)
+                for _ in range(conf['depth'])
+            ])
 
-        self.blocks = nn.ModuleList([
-            TemporalDecoderBlock(dim, conf['num_heads'], conf['mlp_ratio'], conf.get('decoder_dropout', 0.1))
-            for _ in range(conf['depth'])
-        ])
+        self.relpose_embed = None
+        if self.use_relpose and self.temporal:
+            self.relpose_embed = nn.Linear(4, dim)
+            nn.init.zeros_(self.relpose_embed.weight)
+            nn.init.zeros_(self.relpose_embed.bias)
 
         hidden = conf.get('decoder_dim_feedforward', dim * 2)
         drop = conf.get('decoder_dropout', 0.1)
+
         self.predictor = nn.Sequential(
             nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(drop),
             nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 3)
         )
         if self.predict_uncertainty:
-            self.uncertainty_head = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, 3))
-        if self.predict_bond_aux:
-            self.bond_aux_head = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, self.bond_aux_dim))
+            self.uncertainty_head = _mlp_head(dim, hidden, 3, drop)
 
-    def build_temporal_memory(self, context_latents, context_offsets):
+    def build_temporal_memory(self, context_latents, context_offsets, context_relpose=None):
         """
         Args:
             context_latents: (B, T-1, D) pooled latent for each OTHER frame
             context_offsets: (T-1,) or (B, T-1) real temporal offset from center
-
+            context_relpose: (B, T-1, 4) optional (cos, sin, x, y) of each
+                frame's pose relative to the reference frame (A4c only)
         Returns:
             memory: (B, T-1, D) latents tagged with their temporal offset
         """
         B, Tm1, D = context_latents.shape
         if context_offsets.dim() == 1:
             context_offsets = context_offsets.view(1, Tm1).expand(B, Tm1)
-        return context_latents + self.time_embed(context_offsets.long())
+        memory = context_latents + self.time_embed(context_offsets.long())
+        if self.relpose_embed is not None:
+            if context_relpose is None:
+                raise ValueError("decoder.relpose_embedding is on but no relative pose was passed; "
+                                 "the trainer must hand batch['rel_yaw'] / batch['rel_xy'] to the model")
+            memory = memory + self.relpose_embed(context_relpose.to(memory.dtype))
+        return memory
 
     def forward(self, center_tokens, center_pad_mask, context_latents, context_offsets,
-                context_valid_mask, occluded_mask_center, original_keypoints_center):
+                context_valid_mask, occluded_mask_center, original_keypoints_center,
+                context_relpose=None):
         """
         Args:
             center_tokens: (B, V, D) center frame's own contextualized visible tokens
             center_pad_mask: (B, V) bool, True = real visible token
-            context_latents: (B, T-1, D) per-other-frame pooled latents
-            context_offsets: (T-1,) or (B, T-1) real offsets from center frame
-            context_valid_mask: (B, T-1) bool, True = frame actually usable
+            context_latents: (B, T-1, D) per-other-frame pooled latents, or None
+                for a single frame (H = 0)
+            context_offsets: (T-1,) or (B, T-1) real offsets from center frame,
+                or None for a single frame
+            context_valid_mask: (B, T-1) bool, True = frame actually usable,
+                or None for a single frame
             occluded_mask_center: (B, N) bool, True = needs prediction
-            original_keypoints_center: (B, N, 3) center frame GT
+            original_keypoints_center: (B, N, 3) center frame observation,
+                occluded entries already zeroed by the caller
+            context_relpose: (B, T-1, 4) or None, relative pose of each context
+                frame (only used with relpose_embedding, A4c)
 
         Returns:
-            dict with coordinates, occluded_mask, and optional log_sigma /
-            bond_aux_pred (only for occluded keypoints).
+            dict with coordinates, coords_dense, occluded_mask, and the optional
+            log_sigma / frame_se2.
         """
         B, N, _ = original_keypoints_center.shape
-        memory = self.build_temporal_memory(context_latents, context_offsets)
+
+        has_context = (
+            self.temporal
+            and context_latents is not None
+            and context_latents.size(1) > 0
+        )
+        if has_context:
+            memory = self.build_temporal_memory(context_latents, context_offsets, context_relpose)
+        else:
+            # Single-frame decoding: the blocks skip the temporal cross-attention.
+            memory, context_valid_mask = None, None
+
+        if self.block_type == "global":
+            center_tokens = center_tokens + self.type_embed[0]
+            if memory is not None:
+                memory = memory + self.type_embed[1]
 
         queries = self.query_embed.unsqueeze(0).expand(B, -1, -1)
         for block in self.blocks:
             queries = block(queries, center_tokens, center_pad_mask, memory,
-                             memory_key_padding_mask=context_valid_mask)
+                            memory_key_padding_mask=context_valid_mask)
 
-        completed = original_keypoints_center.clone()
-        output = {"occluded_mask": occluded_mask_center}
-
-        if occluded_mask_center.any():
-            occ_queries = queries[occluded_mask_center]
-            pred = self.predictor(occ_queries)
-            completed[occluded_mask_center] = pred
-
-            if self.predict_uncertainty:
-                log_sigma = self.uncertainty_head(occ_queries)
-                sigma_full = torch.zeros(B, self.num_keypoints, 3, device=queries.device, dtype=log_sigma.dtype)
-                sigma_full[occluded_mask_center] = log_sigma
-                output["log_sigma"] = sigma_full
-
-            if self.predict_bond_aux:
-                bond_pred = self.bond_aux_head(occ_queries)
-                bond_full = torch.zeros(B, self.num_keypoints, self.bond_aux_dim, device=queries.device, dtype=bond_pred.dtype)
-                bond_full[occluded_mask_center] = bond_pred
-                output["rel_dist"] = bond_full
-
-        output["coordinates"] = completed
-        return output
-
-class SnapshotModel(nn.Module):
-    def __init__(self, conf, num_keypoints=10):
-        super().__init__()
-
-        self.encoder = SnapshotEncoder(
-            conf=conf["encoder"],
-            num_keypoints=num_keypoints,
+        coords_dense = self.predictor(queries)                             # (B, N, 3)
+        completed = torch.where(
+            occluded_mask_center.unsqueeze(-1), coords_dense, original_keypoints_center
         )
 
-        self.decoder = SnapshotDecoder(
-            conf=conf["decoder"],
-            num_keypoints=num_keypoints,
-        )
-
-    def forward(self, keypoints_3d, occlusion_mask):
-        encoded_features = self.encoder(keypoints_3d, occlusion_mask)  # (B, projdim)
-        decoded = self.decoder(encoded_features, keypoints_3d, occlusion_mask)
-        decoded["encoder_features"] = encoded_features
-        return decoded
-
+        out = {
+            "coordinates": completed,        # observation where visible, prediction where not
+            "coords_dense": coords_dense,    # the same head everywhere, for inspection
+            "occluded_mask": occluded_mask_center,
+        }
+        if self.predict_uncertainty:
+            out["log_sigma"] = self.uncertainty_head(queries)
+        return out
 
 class TemporalModel(nn.Module):
+    """
+    Window in, center-frame pose out.
 
-    def __init__(self, conf, num_keypoints=10, window_size=21, max_offset=96):
+    The arguments come straight from a TemporalWrapper batch:
+        keypoints_window <- batch['window']    (B, W, N, 3), already in the
+                            window's SE(2) frame
+        occlusion_window <- batch['vis_mask']  (B, W, N) True = observed
+        frame_offsets    <- batch['offsets']   (B, W) real frame distances
+        pad_mask         <- batch['pad_mask']  (B, W) True = no evidence
+        rel_yaw, rel_xy  <- batch['rel_yaw'] (B, W), batch['rel_xy'] (B, W, 2);
+                            only read when decoder.relpose_embedding is on (A4c)
+
+    decoder.center_mode
+        "tokens" (default, M0): the center frame enters the decoder as its
+                 per-keypoint tokens (self-attention); the memory holds the
+                 OTHER frames only.
+        "pooled" (ablation A3b): the center frame is pooled like every other
+                 frame and enters only as z_0 + r_0 in the memory (masked when
+                 the center is dropped); the queries self-attend among
+                 themselves only.
+    """
+
+    CENTER_MODES = ("tokens", "pooled")
+
+    def __init__(self, conf, num_keypoints, window_size, max_offset):
         super().__init__()
         self.window_size = window_size
         self.center_idx = window_size // 2
+        self.num_keypoints = num_keypoints
+        self.J = num_keypoints                       # reporting convenience
+        self.W = window_size
+        dec = conf['decoder']
+        self.center_mode = str(dec.get('center_mode', 'tokens')).lower()
+        assert self.center_mode in self.CENTER_MODES, \
+            f"decoder.center_mode must be one of {self.CENTER_MODES}, got {self.center_mode!r}"
+        assert not (self.center_mode == "pooled" and window_size == 1), \
+            "center_mode='pooled' needs a temporal window (T_half >= 1): with H = 0 the decoder would see nothing"
+        # The trainer and the evaluator pass rel_yaw / rel_xy only to models that ask for them.
+        self.uses_relpose = bool(dec.get('relpose_embedding', False)) and window_size > 1
         self.encoder = SnapshotEncoder(conf['encoder'], num_keypoints)
         self.decoder = TemporalDecoder(conf['decoder'], num_keypoints, window_size, max_offset)
 
-    def forward(self, keypoints_window, occlusion_window, frame_offsets=None):
-        """
-        Args:
-            keypoints_window: (B, T, N, 3)
-            occlusion_window: (B, T, N) True = visible
-            frame_offsets: (B, T) real temporal offset of each gathered frame
-                from the center frame. Defaults to (t - center_idx) if not
-                provided, i.e. assumes a consecutive window.
-
-        Returns:
-            dict with coordinates (B, N, 3), occluded_mask (B, N), and
-            optional log_sigma / bond_aux_pred.
-        """
+    def forward(self, keypoints_window, occlusion_window, frame_offsets=None, pad_mask=None,
+                rel_yaw=None, rel_xy=None):
         B, T, N, _ = keypoints_window.shape
         device = keypoints_window.device
+        # Center of the window actually passed in. Equal to self.center_idx when
+        # T == window_size, and 0 for a single frame (H = 0), so a temporal model
+        # can also be run on one frame without indexing past the end.
+        center_idx = T // 2
         if frame_offsets is None:
-            frame_offsets = torch.arange(T, device=device) - self.center_idx
+            frame_offsets = torch.arange(T, device=device) - center_idx
             frame_offsets = frame_offsets.unsqueeze(0).expand(B, T)
         else:
             frame_offsets = frame_offsets.to(device)
 
-        
-        flat_kpts = keypoints_window.reshape(B * T, N, 3) # (B, T, N, 3) -> (B*T, N, 3)
-        flat_occ = occlusion_window.reshape(B * T, N) # (B, T, N) -> (B*T, N)
+        occlusion_window = occlusion_window.bool()
+        if occlusion_window.dim() == 4:
+            occlusion_window = occlusion_window[..., 0]
 
-        flat_latent, flat_tokens, flat_pad_mask, flat_kp_idx = self.encoder(flat_kpts, flat_occ, return_tokens=True)
-        # flat_latent:   (B*T, D)
-        # flat_tokens:   (B*T, V, D)   V = max visible count across the WHOLE batch*time
-        # flat_pad_mask: (B*T, V)
-        # flat_kp_idx:   (B*T, V)
+        keypoints_window = keypoints_window * occlusion_window.unsqueeze(-1).to(keypoints_window.dtype)
+
+        flat_kpts = keypoints_window.reshape(B * T, N, 3)
+        flat_occ = occlusion_window.reshape(B * T, N)
+
+        flat_latent, flat_tokens, flat_pad_mask, flat_kp_idx = self.encoder(
+            flat_kpts, flat_occ, return_tokens=True
+        )
 
         D = flat_latent.shape[-1]
         V = flat_tokens.shape[1]
 
         latent = flat_latent.view(B, T, D)
         tokens = flat_tokens.view(B, T, V, D)
-        pad_mask = flat_pad_mask.view(B, T, V)
-        center_tokens = tokens[:, self.center_idx]        # (B, V, D)
-        center_pad_mask = pad_mask[:, self.center_idx]     # (B, V)
+        padmask_kp = flat_pad_mask.view(B, T, V)
+        center_tokens = tokens[:, center_idx]                      # (B, V, D)
+        center_pad_mask = padmask_kp[:, center_idx]                # (B, V)
 
-        keep = torch.ones(T, dtype=torch.bool, device=device)
-        keep[self.center_idx] = False
+        context_relpose = None
+        if T > 1:
+            keep = torch.ones(T, dtype=torch.bool, device=device)
+            if self.center_mode == "tokens":
+                keep[center_idx] = False                           # M0: center is not in the memory
+            # "pooled" (A3b): keep every slot, the center included, so the memory
+            # holds z_0 + r_0; pad_mask[center] = center_dropped masks it when dropped.
 
-        context_latents = latent[:, keep]                  # (B, T-1, D)
-        context_offsets = frame_offsets[:, keep]            # (B, T-1)
-        context_valid = torch.ones(B, T - 1, dtype=torch.bool, device=device)
+            context_latents = latent[:, keep]                      # (B, T-1, D) or (B, T, D)
+            context_offsets = frame_offsets[:, keep]
 
-        center_occlusion = occlusion_window[:, self.center_idx].bool()
-        if center_occlusion.dim() == 3:
-            center_occlusion = center_occlusion[..., 0]
-        occluded_mask_center = ~center_occlusion
-        center_keypoints = keypoints_window[:, self.center_idx]
+            if pad_mask is not None:
+                context_valid = ~pad_mask.to(device).bool()[:, keep]
+            else:
+                context_valid = torch.ones(B, int(keep.sum()), dtype=torch.bool, device=device)
+
+            if self.uses_relpose:
+                if rel_yaw is None or rel_xy is None:
+                    raise ValueError("decoder.relpose_embedding is on: pass rel_yaw=batch['rel_yaw'], "
+                                     "rel_xy=batch['rel_xy'] to the model")
+                rel_yaw = rel_yaw.to(device).float()
+                rel = torch.cat([torch.cos(rel_yaw).unsqueeze(-1), torch.sin(rel_yaw).unsqueeze(-1),
+                                 rel_xy.to(device).float()], dim=-1)          # (B, T, 4)
+                context_relpose = rel[:, keep]
+        else:
+            # H = 0: a single frame, no other frames to attend to across time.
+            context_latents = context_offsets = context_valid = None
+
+        if self.center_mode == "pooled":
+            # A3b: no per-keypoint center tokens reach the decoder.
+            center_tokens = center_tokens[:, :0]                   # (B, 0, D)
+            center_pad_mask = center_pad_mask[:, :0]               # (B, 0)
+
+        occluded_mask_center = ~occlusion_window[:, center_idx]
+        center_keypoints = keypoints_window[:, center_idx]
 
         return self.decoder(center_tokens, center_pad_mask, context_latents, context_offsets,
-                             context_valid, occluded_mask_center, center_keypoints)
+                            context_valid, occluded_mask_center, center_keypoints,
+                            context_relpose=context_relpose)
 
 
-class GlobalAttentionModel(nn.Module):
+def _get(conf, key, default):
+    """conf.get for dicts and DictConfigs, with None meaning 'use the default'."""
+    if conf is None:
+        return default
+    value = conf.get(key, default)
+    return default if value is None else value
+
+
+class GlobalSelfAttentionModel(nn.Module):
     """
-   Args:
-        conf (dict): Configuration containing:
-            - embed_dim: Embedding dimension
-            - depth: Number of global self-attention transformer blocks
-            - num_heads: Number of attention heads
-            - mlp_ratio: MLP hidden dim ratio
-            - qkv_bias: Whether to use bias in QKV projections
-            - qk_scale: Scaling factor for QK similarity
-            - drop_rate: Dropout rate
-            - attn_drop_rate: Attention dropout rate
-            - decoder_dim_feedforward: hidden dim of the coordinate predictor head
-            - decoder_dropout: dropout for the predictor head
-            - enable_last_norm: whether to apply LayerNorm before prediction
-            - predict_uncertainty: bool, enable per-keypoint uncertainty head
-            - predict_bond_aux: bool, enable auxiliary rigid-to-deform head
-            - bond_aux_dim: int, 1 = scalar bond length, 3 = full relative_dist vector
-        num_keypoints (int): Number of keypoints per frame (default 10)
-        window_size (int): Max number of frames T gathered per window (used only
-            to size RelativeTemporalEncoding's lookup range; actual offsets can
-            be non-consecutive real frame distances, not loop indices)
+    Window in, centre-frame pose out; a drop-in replacement for TemporalModel.
+
+    Args:
+        conf          the `model` config; architecture settings under conf["global"]
+        num_keypoints N
+        window_size   2 * T_half + 1 (only used for the centre index / reporting:
+                      the model itself runs on any window length)
+        max_offset    largest |offset| the offset embedding distinguishes
+                      (train_dataset.max_radius, as for the transformer)
     """
 
-    def __init__(self, conf, num_keypoints=10, window_size=21):
+    def __init__(self, conf, num_keypoints, window_size, max_offset):
         super().__init__()
-        self.num_keypoints = num_keypoints
-        self.window_size = window_size
-        self.embed_dim = conf['embed_dim']
-        self.depth = conf['depth']
-        self.num_heads = conf['num_heads']
-        self.mlp_ratio = conf['mlp_ratio']
-        self.qkv_bias = conf['qkv_bias']
-        self.qk_scale = conf.get('qk_scale', None)
-        self.drop_rate = conf['drop_rate']
-        self.attn_drop_rate = conf['attn_drop_rate']
+        g = _get(conf, "global", {})
+        self.num_keypoints = int(num_keypoints)
+        self.J = self.num_keypoints
+        self.window_size = int(window_size)
+        self.W = self.window_size
+        self.center_idx = self.window_size // 2
+        self.max_offset = int(max_offset)
 
-        self.predict_uncertainty = conf.get('predict_uncertainty', False)
-        self.predict_bond_aux = conf.get('predict_bond_aux', False)
-        self.bond_aux_dim = conf.get('bond_aux_dim', 1)  # 1 = scalar bond length, 3 = full relative_dist vector
+        dim = int(_get(g, "dim", 256))
+        depth = int(_get(g, "depth", 9))
+        heads = int(_get(g, "num_heads", 8))
+        mlp_ratio = float(_get(g, "mlp_ratio", 4.0))
+        qkv_bias = bool(_get(g, "qkv_bias", True))
+        drop = float(_get(g, "drop_rate", 0.1))
+        attn_drop = float(_get(g, "attn_drop_rate", 0.1))
+        hidden = int(_get(g, "decoder_dim_feedforward", 2 * dim))
+        self.predict_uncertainty = bool(_get(g, "predict_uncertainty", False))
+        self.dim, self.depth = dim, depth
 
-        # --- Token construction ---
-        self.keypoint_embed = nn.Linear(3, self.embed_dim)
+        N = self.num_keypoints
+        # Token marking. Named *_embed so the trainer's parameter groups treat
+        # them like the STT's embeddings (no weight decay).
+        self.coord_embed = nn.Linear(3, dim)
+        self.joint_embed = nn.Embedding(N, dim)
+        self.time_embed = RelativeTemporalEncoding(dim, max_offset=self.max_offset)
+        self.type_embed = nn.Parameter(torch.randn(2, dim) * 0.02)        # [query, observation]
+        self.query_embed = nn.Parameter(torch.randn(N, dim) * 0.02)
 
-        # Learnable token substituted in for occluded/invalid keypoints,
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        nn.init.normal_(self.mask_token, std=0.02)
-
-        # In-frame learnale encoding
-        self.kp_identity_embed = nn.Embedding(num_keypoints, self.embed_dim)
-
-        # Temporal encoding:
-        self.time_embed = RelativeTemporalEncoding(self.embed_dim, max_offset=window_size)
-
-        # Global self-attention backbone
         self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=self.embed_dim,
-                num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                qkv_bias=self.qkv_bias,
-                qk_scale=self.qk_scale,
-                drop=self.drop_rate,
-                attn_drop=self.attn_drop_rate,
-            )
-            for _ in range(self.depth)
+            GlobalSelfAttentionBlock(dim, heads, mlp_ratio, qkv_bias, drop, attn_drop) for _ in range(depth)
         ])
+        self.norm = nn.LayerNorm(dim)
 
-        self.last_norm = nn.LayerNorm(self.embed_dim) if conf.get('enable_last_norm', True) else nn.Identity()
-
-        hidden = conf.get('decoder_dim_feedforward', self.embed_dim * 2)
-        dropout = conf.get('decoder_dropout', 0.1)
         self.predictor = nn.Sequential(
-            nn.Linear(self.embed_dim, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(drop),
             nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 3)
         )
-
         if self.predict_uncertainty:
-            self.uncertainty_head = nn.Sequential(
-                nn.Linear(self.embed_dim, hidden), nn.GELU(),
-                nn.Linear(hidden, 3)
-            )
-
-        if self.predict_bond_aux:
-            self.bond_aux_head = nn.Sequential(
-                nn.Linear(self.embed_dim, hidden), nn.GELU(),
-                nn.Linear(hidden, self.bond_aux_dim)
-            )
+            self.uncertainty_head = _mlp_head(dim, hidden, 3, drop)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
+        for name, p in self.named_parameters():
+            if p.dim() > 1 and not name.startswith(("type_embed", "query_embed", "time_embed", "joint_embed")):
                 nn.init.xavier_uniform_(p)
-        nn.init.normal_(self.mask_token, std=0.02)
 
-    def get_num_layers(self):
-        return len(self.blocks) + 1
+    def extra_repr(self):
+        return f"N={self.num_keypoints}, dim={self.dim}, depth={self.depth}, max_offset={self.max_offset}"
 
-    def build_tokens(self, keypoints_window, occlusion_window, frame_offsets):
+    @staticmethod
+    def _pack_visible(usable):
         """
-        Args:
-            keypoints_window: (B, T, N, 3) 3D keypoints for T gathered frames
-                (T frames need not be temporally consecutive)
-            occlusion_window: (B, T, N, 1) bool, True = visible, False = occluded
-            frame_offsets: (T,) or (B, T) real temporal offset of each gathered
-                frame relative to the center frame (e.g. real_frame_idx - center_frame_idx),
-                NOT the loop index t
+        usable: (B, S) bool over the flattened (frame, joint) slots.
+        Returns the slot index of every visible token, packed to the left in
+        ascending (frame, joint) order, and its validity mask:
+            order (B, M) long, valid (B, M) bool, with M = max visible count.
+        """
+        B, S = usable.shape
+        n = usable.sum(1)
+        M = int(n.max()) if B > 0 else 0
+        order = torch.argsort((~usable).to(torch.int8), dim=1, stable=True)[:, :M]
+        valid = torch.arange(M, device=usable.device).unsqueeze(0) < n.unsqueeze(1)
+        return order, valid
 
-        Returns:
-            tokens: (B, T*N, E) tagged token sequence
-            key_valid: (B, T*N) bool, True = usable as attention KEY (visible)
-            kp_idx_flat: (B, T*N) long, keypoint identity per token (for bookkeeping)
-            frame_idx_flat: (B, T*N) long, which frame (0..T-1) each token came from
+    def forward(self, keypoints_window, occlusion_window, frame_offsets=None, pad_mask=None,
+                rel_yaw=None, rel_xy=None):
+        """
+        Args (straight from a TemporalWrapper batch, as for TemporalModel):
+            keypoints_window (B, T, N, 3) window-frame coordinates
+            occlusion_window (B, T, N) or (B, T, N, 1) bool, True = visible
+            frame_offsets    (B, T) signed frame offsets from the centre
+            pad_mask         (B, T) bool, True = slot holds no evidence
+            rel_yaw, rel_xy  accepted and ignored (signature compatibility)
         """
         B, T, N, _ = keypoints_window.shape
         device = keypoints_window.device
+        center = T // 2
 
-        vis_mask = occlusion_window[..., 0] if occlusion_window.dim() == 4 else occlusion_window
-        vis_mask = vis_mask.bool()  # (B, T, N) True=visible
+        vis = occlusion_window.bool()
+        if vis.dim() == 4:
+            vis = vis[..., 0]
+        if frame_offsets is None:
+            frame_offsets = (torch.arange(T, device=device) - center).unsqueeze(0).expand(B, T)
+        else:
+            frame_offsets = frame_offsets.to(device)
 
-        coord_embed = self.keypoint_embed(keypoints_window)  # (B, T, N, E)
+        # Defensive, as in TemporalModel: no hidden coordinate reaches the network.
+        keypoints_window = keypoints_window * vis.unsqueeze(-1).to(keypoints_window.dtype)
 
-        mask_tok = self.mask_token.expand(B, T, N, self.embed_dim)
-        tokens = torch.where(vis_mask.unsqueeze(-1), coord_embed, mask_tok)  # (B, T, N, E)
+        usable = vis
+        if pad_mask is not None:
+            usable = usable & ~pad_mask.to(device).bool().unsqueeze(-1)    # padded frames: no tokens
 
-        kp_idx = torch.arange(N, device=device).view(1, 1, N).expand(B, T, N)
-        tokens = tokens + self.kp_identity_embed(kp_idx)  # in-frame positional (identity) encoding
+        # Gather the visible slots BEFORE embedding: hidden coordinates are never embedded.
+        order, valid = self._pack_visible(usable.reshape(B, T * N))        # (B, M)
+        M = order.shape[1]
+        coords = torch.gather(keypoints_window.reshape(B, T * N, 3), 1, order.unsqueeze(-1).expand(B, M, 3))
+        joint_id = order % N                                               # (B, M)
+        frame_id = order // N
+        offsets = torch.gather(frame_offsets.long(), 1, frame_id)          # (B, M) real offsets
 
-        if frame_offsets.dim() == 1:
-            frame_offsets = frame_offsets.view(1, T).expand(B, T)
-        offsets_per_token = frame_offsets.unsqueeze(-1).expand(B, T, N).long()  # (B, T, N)
-        tokens = tokens + self.time_embed(offsets_per_token)  # temporal encoding
+        obs = (self.coord_embed(coords) + self.joint_embed(joint_id)
+               + self.time_embed(offsets) + self.type_embed[1])
+        obs = obs * valid.unsqueeze(-1).to(obs.dtype)                      # padding slots carry nothing
 
-        tokens = tokens.reshape(B, T * N, self.embed_dim)
-        key_valid = vis_mask.reshape(B, T * N)
-        kp_idx_flat = kp_idx.reshape(B, T * N)
-        frame_idx = torch.arange(T, device=device).view(1, T, 1).expand(B, T, N)
-        frame_idx_flat = frame_idx.reshape(B, T * N)
+        ids = torch.arange(N, device=device)
+        queries = (self.query_embed + self.joint_embed(ids)
+                   + self.time_embed(torch.zeros_like(ids)) + self.type_embed[0])
+        queries = queries.unsqueeze(0).expand(B, N, -1)
 
-        return tokens, key_valid, kp_idx_flat, frame_idx_flat
+        x = torch.cat([queries, obs], dim=1)                               # (B, N + M, D)
+        key_ok = torch.cat([torch.ones(B, N, dtype=torch.bool, device=device), valid], dim=1)
+        attn_mask = key_ok[:, None, None, :]                               # (B, 1, 1, N + M)
 
-    def forward(self, keypoints_window, occlusion_window, frame_offsets):
-        """
-        Args:
-            keypoints_window: (B, T, N, 3)
-            occlusion_window: (B, T, N, 1) True=visible
-            frame_offsets: (T,) or (B, T) real temporal distance of each gathered
-                frame from the center frame (can be non-consecutive/irregular)
-            center_frame_idx: int, index into the T dimension identifying which
-                gathered frame is the "center" frame we are completing
-
-        Returns:
-            dict with:
-                coordinates: (B, N, 3) completed center-frame keypoints
-                occluded_mask: (B, N) bool, True where prediction was made
-                log_sigma: (B, N, 3) [only if predict_uncertainty=True]
-                bond_aux_pred: (B, N, bond_aux_dim) [only if predict_bond_aux=True]
-        """
-        B, T, N, _ = keypoints_window.shape
-        center_frame_idx = T // 2
-        tokens, key_valid, kp_idx_flat, frame_idx_flat = self.build_tokens(keypoints_window, occlusion_window, frame_offsets)
-
-        key_invalid = ~key_valid  # (B, T*N)
-        attn_mask = torch.zeros(B, T * N, T * N, device=tokens.device, dtype=tokens.dtype)
-        attn_mask.masked_fill_(key_invalid.unsqueeze(1), torch.finfo(tokens.dtype).min)
-
-        hidden = tokens
         for block in self.blocks:
-            hidden = block(hidden, attn_mask=attn_mask)
-        hidden = self.last_norm(hidden)
+            x = block(x, attn_mask)
+        q = self.norm(x[:, :N])                                            # (B, N, D)
 
-        hidden = hidden.reshape(B, T, N, self.embed_dim)
+        coords_dense = self.predictor(q)
+        occluded = ~vis[:, center]
+        completed = torch.where(occluded.unsqueeze(-1), coords_dense, keypoints_window[:, center])
 
-        center_tokens = hidden[:, center_frame_idx]              # (B, N, E)
-        center_occlusion = occlusion_window[:, center_frame_idx, :, 0].bool()  # (B, N)
-        occluded_mask_center = ~center_occlusion
-
-        center_keypoints = keypoints_window[:, center_frame_idx]  # (B, N, 3)
-        completed = center_keypoints.clone()
-
-        output = {"occluded_mask": occluded_mask_center}
-
-        if occluded_mask_center.any():
-            occ_queries = center_tokens[occluded_mask_center]  # (num_occ, E)
-
-            pred = self.predictor(occ_queries)
-            completed[occluded_mask_center] = pred
-
-            if self.predict_uncertainty:
-                log_sigma = self.uncertainty_head(occ_queries)   # (num_occ, 3)
-                sigma_full = torch.zeros(B, self.num_keypoints, 3, device=center_tokens.device, dtype=log_sigma.dtype)
-                sigma_full[occluded_mask_center] = log_sigma
-                output["log_sigma"] = sigma_full
-
-            if self.predict_bond_aux:
-                bond_pred = self.bond_aux_head(occ_queries)      # (num_occ, bond_aux_dim)
-                bond_full = torch.zeros(B, self.num_keypoints, self.bond_aux_dim, device=center_tokens.device, dtype=bond_pred.dtype)
-                bond_full[occluded_mask_center] = bond_pred
-                output["bond_aux_pred"] = bond_full
-
-        output["coordinates"] = completed
-        return output
+        out = {
+            "coordinates": completed,        # observation where visible, prediction where not
+            "coords_dense": coords_dense,    # the head everywhere, for inspection
+            "occluded_mask": occluded,
+        }
+        if self.predict_uncertainty:
+            out["log_sigma"] = self.uncertainty_head(q)
+        return out
