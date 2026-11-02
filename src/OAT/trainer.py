@@ -211,7 +211,7 @@ class MetricAccumulator:
 
 
 
-class TemporalTrainer:
+class Trainer:
     MONITOR_DEFAULT = "metric/mpjpe_mm"
 
     def __init__(self, model, loss_fn, train_dataset, val_dataset, config,

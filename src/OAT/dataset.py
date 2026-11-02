@@ -240,10 +240,10 @@ class RawDataset:
         self.frame_theta_rigid = rigid_fit["theta"]
         self.frame_xy_rigid = rigid_fit["t"]
 
-        if verbose:
-            r = self.frame_error_report()
-            print(
-                f"[Dataset] body frame vs rigid GT: "
-                f"yaw RMS {r['yaw_rms_deg']:.3f} deg, "
-                f"xy RMS {r['xy_rms']:.4f}"
-            )
+        # if verbose:
+        #     r = self.frame_error_report()
+        #     print(
+        #         f"[Dataset] body frame vs rigid GT: "
+        #         f"yaw RMS {r['yaw_rms_deg']:.3f} deg, "
+        #         f"xy RMS {r['xy_rms']:.4f}"
+        #     )

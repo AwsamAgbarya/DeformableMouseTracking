@@ -94,9 +94,9 @@ def _build_oat(cfg: DictConfig, kind: str, device: str, logger):
     occ_val = RecordingOcclusion(raw_val.T, raw_val.N, fps=raw_val.fps, config=val_mask_cfg, poses=raw_val.deform_global, seed=val_cfg.seed)
     occ_train.set_epoch(0)
     occ_val.set_epoch(0)
-    rep = occ_train.structure_report()
-    for line in rep["notes"]:
-        logger.info(f"[occlusion] NOTE: {line}")
+    # rep = occ_train.structure_report()
+    # for line in rep["notes"]:
+    #     logger.info(f"[occlusion] NOTE: {line}")
 
     train_dataset = TemporalWrapper.from_global_dataset(raw_train, train_cfg, occlusion=occ_train, with_rigid=True)
     val_dataset = TemporalWrapper(raw_val.deform_global, raw_train.template_xy, raw_train.joint_weights, config=val_cfg, occlusion=occ_val, rigid_world=raw_val.rigid_global, scale=train_dataset.scale)

@@ -291,7 +291,7 @@ class TemporalWrapper(Dataset):
             "conf_R_mean": float(self.frame_conf_R[~self.frame_unusable].mean()),
             "conf_t_mean": float(self.frame_conf_t[~self.frame_unusable].mean()),
         }
-        if self.occlusion is not None:
-            rep.update({f"occ/{k}": v for k, v in self.occlusion.report().items()
-                        if not isinstance(v, list)})
+        # if self.occlusion is not None:
+        #     rep.update({f"occ/{k}": v for k, v in self.occlusion.report().items()
+        #                 if not isinstance(v, list)})
         return rep

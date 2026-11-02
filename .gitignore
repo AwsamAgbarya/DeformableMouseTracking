@@ -13,3 +13,4 @@ eval_cache
 eval_cache_ablations
 eval_cache_nn
 eval_results
+src/configs/testing/*
