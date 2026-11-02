@@ -94,7 +94,7 @@ STT runs at about 2.2 ms per window (batch 256, RTX 4070 Laptop GPU). One traini
 
 ```
 DeformableMouseTracking/
-├── environment.yml / requirements.txt   # snapshots of the author's environment (see Installation)
+├── environment.yml  # snapshots of the author's environment (see Installation)
 └── src/
     ├── train.py                 # Hydra entry point
     ├── registry.py              # experiment registry; builds data, occlusion, model, loss, trainer
@@ -111,7 +111,6 @@ DeformableMouseTracking/
     └── configs/
         ├── config.yaml
         ├── training/            # one file per trained model
-        └── testing/             # evaluation configurations used in the thesis
 ```
 
 ---
@@ -133,7 +132,7 @@ pip install hydra-core omegaconf numpy pandas matplotlib
 pip install wandb          # optional, for experiment logging
 ```
 
-`requirements.txt` and `environment.yml` are full exports of the author's environment. They contain machine-specific `file://` paths and many unrelated packages, so the minimal install above is the easier option.
+`environment.yml` are full exports of the author's environment.
 
 ---
 
@@ -217,21 +216,6 @@ Training uses CUDA when it is available and falls back to the CPU otherwise. `us
 | `latest.pt`, `final.pt` | periodic (every 5 epochs) and last checkpoint |
 | `val_vis_epoch_XXXX.png` | best, median and worst validation reconstructions (top and side views) every 10 epochs |
 | `final_report.json`, `final_report.md` | validation metrics of the best model, broken down by condition and by joint |
-
----
-
-## Evaluation
-
-`configs/testing/` contains the evaluation setup used in the thesis:
-
-| Config | Purpose |
-|---|---|
-| `eval_main.yaml` | STT and all baselines (TP, LI, BFI, NN, ST, TCNN) on every test tier: easy / standard / hard / extreme, ratio sweep, long occlusions, drop-heavy, unstructured (iid) control |
-| `eval_ablations.yaml` | ablation models on the same frozen occlusion fields, plus compute and memory profiling |
-| `tune_nn.yaml` | picks k for the NN baseline on the validation recording |
-| `verification.yaml` | checks of the occlusion model and canonicalization before training |
-
-These configs call an `evaluation` package (`python -m evaluation.evaluate`, `python -m evaluation.analyze`, …) that is not currently part of this repository. They expect learned models at `../checkpoints/OAT/<run_name>/best.pt` together with the `config.yaml` saved next to each checkpoint. For example, `eval_main.yaml` looks for the TCNN under `tcn_s42`, so train it with `training.run_name=tcn_s42` or change the path.
 
 ---
 
